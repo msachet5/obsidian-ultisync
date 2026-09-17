@@ -149,6 +149,26 @@ export function isTooLargeError(error: unknown): boolean {
 	);
 }
 
+/**
+ * True when GitHub (or the edge in front of it) failed in a way that has
+ * nothing to do with the request itself — a bad gateway, an overloaded
+ * server, a timeout. These are common on the very first push, which asks the
+ * Git Database API to build a tree covering the whole vault in one call, and
+ * they clear up on their own within a few seconds.
+ */
+export function isTransientServerError(error: unknown): boolean {
+	if (!(error instanceof GitHubApiError)) return false;
+	return error.status === 502 || error.status === 503 || error.status === 504;
+}
+
+/** Retries for a transient server error, before giving up and surfacing it. */
+const MAX_TRANSIENT_RETRIES = 4;
+const TRANSIENT_RETRY_BACKOFF_MS = [500, 1500, 3000, 5000];
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 /** ETag per owner/repo/branch, so an unchanged branch read costs no rate limit. */
 const branchRefCache = new Map<string, { etag: string; ref: GitReference }>();
 
@@ -242,6 +262,13 @@ export class GitHubClient {
 			Authorization: `Bearer ${this.token}`,
 			'X-GitHub-Api-Version': this.apiVersion,
 			'User-Agent': 'ultisync',
+			// requestUrl goes through the platform's own HTTP cache (Chromium on
+			// desktop, the system cache on iOS), and GitHub marks API answers
+			// cacheable for a minute. A poll served from that cache reports a
+			// branch that has not moved when it has. The plugin does its own
+			// conditional requests, so nothing is lost by refusing the cache.
+			'Cache-Control': 'no-cache',
+			Pragma: 'no-cache',
 		};
 	}
 
@@ -255,31 +282,36 @@ export class GitHubClient {
 
 	private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
 		this.ensureConfigured();
-		try {
-			const response = await requestUrl({
-				url: `${this.baseUrl}${path}`,
-				method,
-				headers: this.headers(),
-				body: body === undefined ? undefined : JSON.stringify(body),
-				throw: false,
-			});
-			const parsed = parseBody(response.text);
-			if (response.status < 200 || response.status >= 300) {
-				throw new GitHubApiError(
-					response.status,
-					`${messageOf(parsed, `HTTP ${response.status}`)} (${method} ${path})`,
-					parsed,
-					rateLimitOf(response.headers),
-				);
+		for (let attempt = 0; ; attempt++) {
+			try {
+				const response = await requestUrl({
+					url: `${this.baseUrl}${path}`,
+					method,
+					headers: this.headers(),
+					body: body === undefined ? undefined : JSON.stringify(body),
+					throw: false,
+				});
+				const parsed = parseBody(response.text);
+				if (response.status < 200 || response.status >= 300) {
+					throw new GitHubApiError(
+						response.status,
+						`${messageOf(parsed, `HTTP ${response.status}`)} (${method} ${path})`,
+						parsed,
+						rateLimitOf(response.headers),
+					);
+				}
+				return parsed as T;
+			} catch (error) {
+				const wrapped =
+					error instanceof GitHubApiError
+						? error
+						: new GitHubApiError(0, 'Unable to reach GitHub. Check the network connection.', error);
+				if (isTransientServerError(wrapped) && attempt < MAX_TRANSIENT_RETRIES) {
+					await sleep(TRANSIENT_RETRY_BACKOFF_MS[attempt] ?? 5000);
+					continue;
+				}
+				throw wrapped;
 			}
-			return parsed as T;
-		} catch (error) {
-			if (error instanceof GitHubApiError) throw error;
-			throw new GitHubApiError(
-				0,
-				'Unable to reach GitHub. Check the network connection.',
-				error,
-			);
 		}
 	}
 
@@ -289,7 +321,10 @@ export class GitHubClient {
 	// absent the cache simply stays empty and this behaves like a plain GET.
 	async getBranchReference(skipCache = false): Promise<GitReference> {
 		const branch = encodeURIComponent(this.branchRef());
-		const path = this.repoPath(`/git/ref/${branch}`);
+		// A fresh query string each time is the one thing every HTTP cache
+		// respects. GitHub ignores the parameter, and the ETag is computed
+		// from the body, so the conditional request still answers 304.
+		const path = this.repoPath(`/git/ref/${branch}?t=${Date.now()}`);
 		const key = this.cacheKey();
 		const cached = skipCache ? undefined : branchRefCache.get(key);
 
@@ -343,37 +378,42 @@ export class GitHubClient {
 		if (etag) {
 			headers['If-None-Match'] = etag;
 		}
-		try {
-			const response = await requestUrl({
-				url: `${this.baseUrl}${path}`,
-				method: 'GET',
-				headers,
-				throw: false,
-			});
-			if (response.status === 304) {
-				return { status: 304, body: undefined, etag };
+		for (let attempt = 0; ; attempt++) {
+			try {
+				const response = await requestUrl({
+					url: `${this.baseUrl}${path}`,
+					method: 'GET',
+					headers,
+					throw: false,
+				});
+				if (response.status === 304) {
+					return { status: 304, body: undefined, etag };
+				}
+				const parsed = parseBody(response.text);
+				if (response.status < 200 || response.status >= 300) {
+					throw new GitHubApiError(
+						response.status,
+						`${messageOf(parsed, `HTTP ${response.status}`)} (GET ${path})`,
+						parsed,
+						rateLimitOf(response.headers),
+					);
+				}
+				return {
+					status: response.status,
+					body: parsed as T | undefined,
+					etag: readEtag(response.headers),
+				};
+			} catch (error) {
+				const wrapped =
+					error instanceof GitHubApiError
+						? error
+						: new GitHubApiError(0, 'Unable to reach GitHub. Check the network connection.', error);
+				if (isTransientServerError(wrapped) && attempt < MAX_TRANSIENT_RETRIES) {
+					await sleep(TRANSIENT_RETRY_BACKOFF_MS[attempt] ?? 5000);
+					continue;
+				}
+				throw wrapped;
 			}
-			const parsed = parseBody(response.text);
-			if (response.status < 200 || response.status >= 300) {
-				throw new GitHubApiError(
-					response.status,
-					`${messageOf(parsed, `HTTP ${response.status}`)} (GET ${path})`,
-					parsed,
-					rateLimitOf(response.headers),
-				);
-			}
-			return {
-				status: response.status,
-				body: parsed as T | undefined,
-				etag: readEtag(response.headers),
-			};
-		} catch (error) {
-			if (error instanceof GitHubApiError) throw error;
-			throw new GitHubApiError(
-				0,
-				'Unable to reach GitHub. Check the network connection.',
-				error,
-			);
 		}
 	}
 
