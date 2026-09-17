@@ -29,6 +29,8 @@ and has no way to.
 - Refs, commits, trees and blobs via the GitHub Git Database REST API
 - Fine-grained personal access token authentication
 - Sync on demand, an immediate push, and a first-run initial pull
+- A starting-point comparison that lets a vault merge with, replace, or be
+  replaced by the repository, with every loss listed and confirmed first
 - Debounced automatic push after local changes settle
 - Polling and a pull on app activation while Obsidian is in the foreground
 - Independent pull and push extension filters, and ignored path prefixes
@@ -186,8 +188,10 @@ Open status panel
 Open settings
 ```
 
-Push and reset are buttons in the plugin settings under **Actions**. Pulling is
-automatic, and **Sync now** forces a full cycle.
+Push and reset are buttons in the plugin settings under **Danger zone**. Both
+work whether the Sync switch is on or off, and both show their progress in the
+button itself while they run. Pulling is automatic, and **Sync now** forces a
+full cycle.
 
 Commits created by the plugin look like:
 
@@ -196,6 +200,36 @@ Sync from desktop at 2026-08-16 11:45:22
 ```
 
 ## Behavior
+
+### Linking a vault
+
+The first time credentials are saved, or Sync is switched on for a vault that
+has never been linked, the plugin compares the vault with the repository and
+puts the result to you before anything moves. Files that exist on both sides
+with the same bytes are recorded as synced and never transferred.
+
+Two questions follow, each only when it applies:
+
+- **Which version wins** for files that exist in both places with different
+  contents. There is no shared history to merge from, so one side has to.
+  Choosing this vault replaces GitHub's copy in the linking commit; choosing
+  GitHub trashes the local copy and downloads GitHub's.
+- **What to do with files only one side has.** *Keep both* downloads GitHub's
+  extras and uploads the vault's. *Use only this vault* deletes GitHub's extras
+  from the repository. *Use only GitHub* moves the vault's extras to the trash.
+
+Anything a choice loses is listed and confirmed before the plugin acts. A file
+deleted from GitHub remains in the repository's history; a trashed file follows
+Obsidian's own **Deleted files** setting.
+
+Pressing **Push** on a vault that has never been linked runs the same
+comparison, and the choice made there is what carries the push out. Sync stays
+off in that case; only the switch turns it on.
+
+Saving credentials that point at a different repository or branch clears the
+vault's synchronization record first. Tracking built against one repository
+would read as mass deletions against another. Saving a new token for the same
+repository changes nothing else.
 
 ### Automatic push
 
@@ -233,6 +267,11 @@ Branch heads are read conditionally, and GitHub's ref reads are eventually
 consistent. A read taken shortly after a push can return the previous head,
 either from GitHub or from a 304 served out of the local ETag cache.
 
+The platform's own HTTP cache is bypassed for these reads. Obsidian's
+`requestUrl` goes through Chromium's cache on desktop and the system cache on
+iOS, and GitHub marks API responses cacheable for a minute, which is long
+enough for a five-second poll to keep reporting a branch that has moved.
+
 Before applying anything, the plugin asks GitHub how the returned head relates
 to the commit it last synced. A head that is `behind` or `identical` is treated
 as stale: nothing is applied, the cached ETag is dropped so the next poll asks
@@ -242,6 +281,14 @@ Without that check the vault flickers. Files the device just pushed still carry
 their new blob SHA locally, so against a stale tree each of them reads as a
 remote change, gets overwritten with its previous contents, and is restored on
 the following poll.
+
+### A synced commit GitHub no longer knows
+
+If the commit this vault last synced to has been rewritten away — a force push
+or a recreated branch — GitHub answers the comparison with 404. That is
+treated as the two sides having diverged: the remote tree is reconciled with
+deletions withheld, and synchronization carries on. Only a 404 that the
+repository itself answers, when the branch is read again, switches Sync off.
 
 ### Deletions
 
@@ -275,6 +322,14 @@ rename preserves content.
 
 A file renamed and edited in the same commit has a different SHA, and is handled
 as a deletion plus a download.
+
+### Returning to a device
+
+Bringing Obsidian back to the foreground checks the branch at once, and at most
+every five minutes also runs the thorough check: file counts against the
+recorded tree, and files whose size on disk disagrees with GitHub while
+claiming to be the same blob. Clicking in and out of the window does not pay
+for that tree read each time.
 
 ### Rate limits
 
@@ -319,9 +374,11 @@ src/
 │   ├── PushManager.ts
 │   ├── RenameRecord.ts
 │   ├── SetupCheck.ts
+│   ├── SetupPlan.ts
 │   ├── SyncManager.ts
 │   ├── SyncState.ts
-│   └── TextMerge.ts
+│   ├── TextMerge.ts
+│   └── Verify.ts
 ├── ui/
 │   ├── ConfirmModal.ts
 │   ├── ConflictModal.ts
