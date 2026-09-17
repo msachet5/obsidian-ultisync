@@ -5,7 +5,8 @@ import { SyncStateStore, generateDeviceId } from './sync/SyncState';
 import { ConflictModal } from './ui/ConflictModal';
 import { ConfirmModal, confirmWithModal } from './ui/ConfirmModal';
 import { CredentialDraft, SettingsTab } from './ui/SettingsTab';
-import { SetupCheckModal, SetupDecision } from './ui/SetupCheckModal';
+import { SetupCheckModal, SetupModalOptions, SetupOutcome } from './ui/SetupCheckModal';
+import { planFor } from './sync/SetupPlan';
 import { StatusBarController } from './ui/StatusBar';
 import { ULTISYNC_ICON, registerIcons } from './ui/icons';
 import { SYNC_PANEL_VIEW_TYPE, SyncPanelView } from './ui/SyncPanelView';
@@ -101,6 +102,12 @@ export default class UltiSyncPlugin extends Plugin {
 	// early but the one tick that clears them still lands.
 	private progressPainted = false;
 
+	// Set while the plugin itself is moving files in bulk, so the vault events
+	// that produces are not mistaken for the user's edits. A reset trashing a
+	// vault used to arm a push that would have deleted those files from
+	// GitHub before the re-pull had brought them back.
+	private vaultEventsMuted = false;
+
 	async onload(): Promise<void> {
 		// Before anything asks for one by name.
 		registerIcons();
@@ -125,10 +132,12 @@ export default class UltiSyncPlugin extends Plugin {
 				hasCredentials: () => this.hasCredentials(),
 				getConnectionState: () => this.getConnectionState(),
 				confirmReset: () => this.confirmReset(),
-				pushNow: () => this.syncManager.pushEverything(),
+				pushNow: () => this.pushFromSettings(),
 				resetSyncState: () => this.resetSyncState(),
 				getDeviceId: () => this.state.deviceId,
 				getStatus: () => this.statusSnapshot(),
+				getProgress: () => this.syncManager.getProgress(),
+				isBusy: () => this.checkRunning || this.syncManager.isRunning(),
 				},
 			this,
 		);
@@ -242,6 +251,7 @@ export default class UltiSyncPlugin extends Plugin {
 		this.progressPainted = active;
 
 		this.statusBar.setProgress(progress, countdown);
+		this.settingsTab?.paintProgress();
 		for (const leaf of this.app.workspace.getLeavesOfType(SYNC_PANEL_VIEW_TYPE)) {
 			const view = leaf.view;
 			if (view instanceof SyncPanelView) view.paintProgress();
@@ -321,7 +331,22 @@ export default class UltiSyncPlugin extends Plugin {
 	 * failed check withholds is automatic synchronization, not the settings.
 	 */
 	private async applyCredentials(draft: CredentialDraft): Promise<void> {
+		// A different repository or branch makes every record this vault holds
+		// about "the remote" a record about somewhere else. Applied against
+		// the new place it would read as mass deletions in both directions.
+		const target = (c: CredentialDraft): string =>
+			`${c.githubOwner.trim()}/${c.githubRepo.trim()}#${c.branch.trim() || 'main'}`;
+		const movedRepository = target(this.settings) !== target(draft);
+
 		Object.assign(this.settings, draft);
+		if (movedRepository && this.state.lastSyncedCommit) {
+			this.syncManager.destroy();
+			this.state = { ...DEFAULT_STATE, deviceId: this.state.deviceId };
+			this.restartSyncManager();
+			this.state.debugLog.push(
+				`${new Date().toISOString()} repository changed to ${target(draft)}; sync state cleared`,
+			);
+		}
 		await this.persistEverything();
 
 		const probe = await this.probeConnection(draft);
@@ -331,7 +356,18 @@ export default class UltiSyncPlugin extends Plugin {
 			return;
 		}
 
-		await this.runSetupCheck();
+		// Only the token changed on a vault that is already linked: there is
+		// nothing to compare, and the comparison would only offer to redo what
+		// is already done.
+		if (!this.syncManager.needsStartingPoint()) {
+			this.settings.syncEnabled = true;
+			await this.persistEverything();
+			this.refreshDerivedStatus();
+			this.refreshSettingsTab();
+			return;
+		}
+
+		await this.runSetupCheck({ enableSync: true });
 	}
 
 	private async setSyncEnabled(enabled: boolean): Promise<void> {
@@ -354,11 +390,41 @@ export default class UltiSyncPlugin extends Plugin {
 		await this.persistEverything();
 
 		if (this.syncManager.needsStartingPoint()) {
-			await this.runSetupCheck();
+			await this.runSetupCheck({ enableSync: true });
 			return;
 		}
 		// Already linked, so switching on simply resumes.
 		this.refreshDerivedStatus();
+	}
+
+	/**
+	 * The Push button. It works whether or not the switch is on: the switch
+	 * governs what happens by itself, not what a person may ask for. A vault
+	 * that has never been linked is compared first, and the choice made there
+	 * is what carries the push out.
+	 */
+	private async pushFromSettings(): Promise<void> {
+		if (!this.hasCredentials()) {
+			new Notice('UltiSync: enter the GitHub owner, repository and token first.');
+			return;
+		}
+		if (this.checkRunning || this.syncManager.isRunning()) {
+			new Notice('UltiSync: another operation is in progress. Try again when it finishes.');
+			return;
+		}
+		if (this.connectionState !== 'healthy') {
+			const probe = await this.probeConnection();
+			if (!probe.ok) {
+				new Notice(`UltiSync: ${probe.message}`, 12000);
+				return;
+			}
+		}
+
+		if (this.syncManager.needsStartingPoint()) {
+			await this.runSetupCheck({ enableSync: false, reason: 'push' });
+			return;
+		}
+		await this.syncManager.pushEverything();
 	}
 
 	/** Clears credentials and all synchronization bookkeeping. Files are kept. */
@@ -379,9 +445,21 @@ export default class UltiSyncPlugin extends Plugin {
 		new Notice('UltiSync: credentials and settings cleared. Your files were not touched.');
 	}
 
-	// Runs the comparison and puts the outcome to the user. Nothing is written
-	// until they answer, and declining leaves synchronization switched off.
-	private async runSetupCheck(): Promise<void> {
+	/**
+	 * Runs the comparison and puts the outcome to the user. Nothing is written
+	 * until they answer, and the returned promise settles only once whatever
+	 * they chose has been carried out, so a button that started this can show
+	 * it working the whole way through.
+	 *
+	 * With `enableSync` the switch goes on as the decision is accepted, which
+	 * is what turning it on or saving credentials means. Without it the vault
+	 * is linked and the plan carried out, but nothing automatic starts: that is
+	 * what a plain Push on an unlinked vault asks for.
+	 */
+	private async runSetupCheck(options: {
+		enableSync: boolean;
+		reason?: 'push';
+	}): Promise<void> {
 		if (this.checkRunning) return;
 		this.checkRunning = true;
 		this.setStatus(
@@ -412,41 +490,77 @@ export default class UltiSyncPlugin extends Plugin {
 			const message = describeConnectionFailure(error);
 			console.error('[UltiSync]', error);
 			new Notice(`UltiSync: ${message}`, 12000);
-			this.setConnectionState('failed');
-			this.setStatus('error', message);
-			await this.disableSync();
+			// Only GitHub's answer says anything about the connection. A check
+			// refused because something else was running says nothing.
+			if (error instanceof GitHubApiError) {
+				this.setConnectionState('failed');
+				this.setStatus('error', message);
+				if (options.enableSync) await this.disableSync();
+			} else {
+				this.refreshDerivedStatus();
+			}
 			return;
 		} finally {
 			this.checkRunning = false;
 		}
 
 		this.setStatus('pending', `Comparison complete: ${summarize(result)}.`);
-		new SetupCheckModal(this.app, result, (decision) => {
-			void this.applySetupDecision(decision);
-		}).open();
+
+		const modal: SetupModalOptions = options.enableSync
+			? {
+					primaryLabel: 'Start syncing',
+					cancelNote:
+						'Cancelling leaves synchronization switched off. Turning Sync back on runs this check again.',
+				}
+			: {
+					primaryLabel: 'Push',
+					cancelNote:
+						'Cancelling changes nothing. Sync stays off either way; this only links the vault and pushes it.',
+				};
+
+		const outcome = await new Promise<SetupOutcome>((resolve) => {
+			new SetupCheckModal(this.app, result, modal, resolve).open();
+		});
+		await this.applySetupDecision(result, outcome, options.enableSync);
 	}
 
-	private async applySetupDecision(decision: SetupDecision): Promise<void> {
-		if (decision === 'cancel') {
-			new Notice('UltiSync: left switched off. Turn Sync on to run the check again.');
-			await this.disableSync();
+	private async applySetupDecision(
+		result: SetupCheckResult,
+		outcome: SetupOutcome,
+		enableSync: boolean,
+	): Promise<void> {
+		if (outcome === 'cancel') {
+			if (enableSync) {
+				new Notice('UltiSync: left switched off. Turn Sync on to run the check again.');
+				await this.disableSync();
+			} else {
+				new Notice('UltiSync: cancelled. Nothing was changed.');
+				this.refreshDerivedStatus();
+			}
 			return;
 		}
 
 		// Accepting an outcome is the moment synchronization starts. Enabled
 		// before the transfer so the manager is live for what follows, and
 		// persisted so the switch in settings agrees.
-		this.settings.syncEnabled = true;
-		await this.persistEverything();
-		this.refreshSettingsTab();
-
-		if (decision === 'pull') {
-			await this.syncManager.adoptRemote();
-		} else {
-			await this.syncManager.adoptLocal();
+		if (enableSync) {
+			this.settings.syncEnabled = true;
+			await this.persistEverything();
+			this.refreshSettingsTab();
 		}
 
+		await this.syncManager.adopt(result, planFor(result, outcome));
+		this.refreshDerivedStatus();
 		this.refreshSettingsTab();
+
+		// Nothing on either side leaves nothing to link to: the repository has
+		// no commit until a file is pushed, and there is no file to push.
+		if (this.syncManager.needsStartingPoint() && result.relation === 'remote-empty') {
+			new Notice(
+				'UltiSync: both this vault and the repository are empty, so there is nothing to link yet. Add a note, then press Push or turn Sync off and on.',
+				12000,
+			);
+		}
 	}
 
 	private async disableSync(): Promise<void> {
@@ -472,7 +586,12 @@ export default class UltiSyncPlugin extends Plugin {
 			return;
 		}
 		if (!this.settings.syncEnabled) {
-			this.setStatus('off', 'Synchronization is off.');
+			this.setStatus(
+				'off',
+				this.syncManager?.needsStartingPoint()
+					? 'Synchronization is off. Not linked to GitHub yet.'
+					: 'Synchronization is off. Push and Reset still work from settings.',
+			);
 			return;
 		}
 		if (this.syncManager?.needsStartingPoint()) {
@@ -548,6 +667,7 @@ export default class UltiSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on('rename', (file, oldPath) => {
+				if (this.vaultEventsMuted) return;
 				if (
 					oldPath &&
 					!this.syncManager.isSelfWrite(oldPath) &&
@@ -580,6 +700,7 @@ export default class UltiSyncPlugin extends Plugin {
 	}
 
 	private handleVaultPath(path: string): void {
+		if (this.vaultEventsMuted) return;
 		if (this.syncManager.isSelfWrite(path)) return;
 		if (isIgnoredPath(path, this.settings.ignoredPaths)) return;
 
@@ -659,16 +780,28 @@ export default class UltiSyncPlugin extends Plugin {
 			return;
 		}
 
+		if (this.checkRunning || this.syncManager.isRunning()) {
+			new Notice('UltiSync: another operation is in progress. Try again when it finishes.');
+			return;
+		}
+
 		this.syncManager?.destroy();
 		this.setStatus('syncing', 'Resetting local files...');
 
+		// Every trashed file fires a delete event. Left audible, those events
+		// marked the vault dirty and armed a push that would have carried the
+		// deletions to GitHub before the re-pull restored the files.
+		this.vaultEventsMuted = true;
 		try {
+			let done = 0;
+			this.syncManager.setProgress({ phase: 'clear', done, total: managed.length });
 			for (const file of managed) {
 				// Same rule as every other deletion in the plugin: trashFile puts
 				// the file wherever the vault's "Deleted files" preference says.
 				// Nothing here bypasses that, because a file that was edited
 				// locally and never pushed does not come back from GitHub.
 				await this.app.fileManager.trashFile(file);
+				this.syncManager.setProgress({ phase: 'clear', done: ++done, total: managed.length });
 			}
 		} catch (error) {
 			console.error('[UltiSync]', error);
@@ -676,6 +809,9 @@ export default class UltiSyncPlugin extends Plugin {
 			this.setStatus('error', 'Reset failed while clearing local files.');
 			this.restartSyncManager();
 			return;
+		} finally {
+			this.vaultEventsMuted = false;
+			this.syncManager.setProgress(null);
 		}
 
 		this.state = {
@@ -685,6 +821,7 @@ export default class UltiSyncPlugin extends Plugin {
 		await this.persistEverything();
 		this.restartSyncManager();
 		await this.syncManager.initialPull(true);
+		this.refreshDerivedStatus();
 	}
 
 	/**
@@ -718,8 +855,12 @@ export default class UltiSyncPlugin extends Plugin {
 	}
 
 	private setStatus(status: SyncStatus, detail?: string): void {
+		const nextDetail = detail ?? status;
+		// Every keystroke reports "pending" again. Rebuilding the panel for a
+		// status it already shows threw away its scroll position for nothing.
+		if (status === this.currentStatus && nextDetail === this.currentStatusDetail) return;
 		this.currentStatus = status;
-		this.currentStatusDetail = detail ?? status;
+		this.currentStatusDetail = nextDetail;
 		this.statusBar?.set(status, detail);
 		this.refreshPanel();
 	}

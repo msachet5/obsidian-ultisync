@@ -1,107 +1,249 @@
 import { App, Modal, Setting } from 'obsidian';
 import { SetupCheckResult } from '../sync/SetupCheck';
+import {
+	ExtrasPolicy,
+	SetupDecision,
+	Winner,
+	isDecided,
+	isDestructive,
+	planFor,
+} from '../sync/SetupPlan';
+import { ConfirmModal } from './ConfirmModal';
+
+/** The answer the modal reports: a decision to carry out, or nothing. */
+export type SetupOutcome = SetupDecision | 'cancel';
+
+export interface SetupModalOptions {
+	/** What the primary button says. "Start syncing" when the switch is
+	 *  about to go on; "Push" when a push is what asked for the check. */
+	primaryLabel: string;
+	/** Shown under the buttons, explaining what cancelling leaves behind. */
+	cancelNote: string;
+}
+
+function count(n: number, noun = 'file'): string {
+	return `${n} ${noun}${n === 1 ? '' : 's'}`;
+}
 
 /**
- * What the user decided to do about the difference between vault and repo.
- * "link" records the current position without moving any file.
+ * Puts the comparison to the user and collects one decision.
+ *
+ * Three situations need no choice at all and get a single button: nothing
+ * differs, GitHub is empty, or one side simply has more. Everything else is
+ * built from two questions asked only when they apply — which version wins
+ * for a file that differs in both places, and whether files only one side has
+ * are kept or dropped — so a vault that only needs one answer is never asked
+ * two. A choice that loses files is confirmed here, with the list, before the
+ * modal reports it.
  */
-export type SetupDecision = 'link' | 'pull' | 'push' | 'cancel';
-
-interface Choice {
-	title: string;
-	body: string;
-	/** Buttons other than cancel, in order. The first is the primary action. */
-	actions: { label: string; decision: SetupDecision; warn?: boolean }[];
-}
-
-function choiceFor(result: SetupCheckResult): Choice {
-	const { relation, localOnly, remoteOnly, conflicting } = result;
-
-	switch (relation) {
-		case 'up-to-date':
-			return {
-				title: 'This vault is up to date',
-				body: 'Everything here already matches GitHub. Synchronization will start from now on.',
-				actions: [{ label: 'Start syncing', decision: 'link' }],
-			};
-
-		case 'remote-empty':
-			return {
-				title: 'The repository is empty',
-				body: `Nothing is on GitHub yet, so this vault's ${localOnly.length} file(s) will be uploaded as the starting point.`,
-				actions: [{ label: 'Upload and start syncing', decision: 'push' }],
-			};
-
-		case 'remote-ahead':
-			return {
-				title: 'GitHub is ahead',
-				body: `GitHub has ${remoteOnly.length} file(s) this vault does not, and nothing here conflicts with them. They can be downloaded without replacing any of your work.`,
-				actions: [{ label: 'Proceed', decision: 'pull' }],
-			};
-
-		case 'local-ahead':
-			return {
-				title: 'This vault is ahead',
-				body: `This vault has ${localOnly.length} file(s) GitHub does not, and nothing on GitHub conflicts with them. They can be pushed without replacing anything there.`,
-				actions: [{ label: 'Push and start syncing', decision: 'push' }],
-			};
-
-		case 'both-ahead':
-			return {
-				title: 'Both sides have new files',
-				body: `This vault has ${localOnly.length} file(s) GitHub does not, and GitHub has ${remoteOnly.length} this vault does not. No file differs on both sides, so the two sets can simply be combined.`,
-				actions: [{ label: 'Merge and start syncing', decision: 'push' }],
-			};
-
-		case 'diverged':
-			return {
-				title: 'These cannot be merged cleanly',
-				body: `${conflicting.length} file(s) exist in both places with different contents. There is no shared history to merge them from, so one side has to be the starting point. The versions that lose are moved to the vault's .trash rather than destroyed.`,
-				actions: [
-					{ label: 'Upload this vault', decision: 'push', warn: true },
-					{ label: 'Download from GitHub', decision: 'pull', warn: true },
-				],
-			};
-	}
-}
-
 export class SetupCheckModal extends Modal {
 	private resolved = false;
+	private winner: Winner | null = null;
+	private extras: ExtrasPolicy = 'keep';
+	private primaryButton: HTMLButtonElement | null = null;
 
 	constructor(
 		app: App,
 		private result: SetupCheckResult,
-		private onDecision: (decision: SetupDecision) => void,
+		private options: SetupModalOptions,
+		private onDecision: (outcome: SetupOutcome) => void,
 	) {
 		super(app);
 	}
 
 	onOpen(): void {
-		const { contentEl } = this;
+		const { contentEl, result } = this;
 		contentEl.empty();
+		this.modalEl.addClass('ultisync-setup-modal');
 
-		const choice = choiceFor(this.result);
-		this.titleEl.setText(choice.title);
-		contentEl.createEl('p', { text: choice.body });
+		this.titleEl.setText(this.title());
+		contentEl.createEl('p', { text: this.summary() });
+
+		if (result.conflicting.length) this.renderWinnerChoice();
+		if (this.hasExtras() && result.relation !== 'remote-empty') this.renderExtrasChoice();
 
 		this.renderFileLists();
 
 		const buttons = new Setting(contentEl);
-		for (const [index, action] of choice.actions.entries()) {
-			buttons.addButton((button) => {
-				button.setButtonText(action.label).onClick(() => this.decide(action.decision));
-				if (action.warn) button.setWarning();
-				else if (index === 0) button.setCta();
-			});
-		}
+		buttons.addButton((button) => {
+			this.primaryButton = button.buttonEl;
+			button.setButtonText(this.options.primaryLabel).onClick(() => this.submit());
+		});
 		buttons.addButton((button) =>
 			button.setButtonText('Cancel').onClick(() => this.decide('cancel')),
 		);
+		this.refreshPrimary();
 
 		contentEl.createEl('p', {
 			cls: 'setting-item-description',
-			text: 'Cancelling leaves synchronization switched off. Turning Sync back on runs this check again.',
+			text: this.options.cancelNote,
 		});
+	}
+
+	private hasExtras(): boolean {
+		return this.result.localOnly.length > 0 || this.result.remoteOnly.length > 0;
+	}
+
+	private title(): string {
+		switch (this.result.relation) {
+			case 'up-to-date':
+				return 'This vault is up to date';
+			case 'remote-empty':
+				return 'The repository is empty';
+			case 'remote-ahead':
+				return 'GitHub has files this vault does not';
+			case 'local-ahead':
+				return 'This vault has files GitHub does not';
+			case 'both-ahead':
+				return 'Both sides have files the other does not';
+			case 'diverged':
+				return 'Some files differ on both sides';
+		}
+	}
+
+	private summary(): string {
+		const { relation, localOnly, remoteOnly, conflicting } = this.result;
+		switch (relation) {
+			case 'up-to-date':
+				return 'Everything here already matches GitHub. Nothing will be moved.';
+			case 'remote-empty':
+				return `Nothing is on GitHub yet, so this vault's ${count(localOnly.length)} will be uploaded as the starting point.`;
+			case 'remote-ahead':
+				return `GitHub has ${count(remoteOnly.length)} this vault does not, and nothing here conflicts with them.`;
+			case 'local-ahead':
+				return `This vault has ${count(localOnly.length)} GitHub does not, and nothing on GitHub conflicts with them.`;
+			case 'both-ahead':
+				return `This vault has ${count(localOnly.length)} GitHub does not, and GitHub has ${count(remoteOnly.length)} this vault does not. No file differs on both sides.`;
+			case 'diverged':
+				return `${count(conflicting.length)} exist in both places with different contents. There is no shared history to merge them from, so one side has to win for those files. The versions that lose are moved to the vault's trash, or replaced on GitHub.`;
+		}
+	}
+
+	/** Which side wins for the files that differ. Mandatory when it applies. */
+	private renderWinnerChoice(): void {
+		const n = this.result.conflicting.length;
+		const group = this.contentEl.createDiv({ cls: 'ultisync-choice' });
+		group.createDiv({
+			cls: 'ultisync-choice-title',
+			text: `Which version wins for the ${count(n, 'differing file')}?`,
+		});
+		this.radio(group, 'winner', 'local', 'This vault', `GitHub's ${count(n)} are replaced with the versions here.`);
+		this.radio(group, 'winner', 'remote', 'GitHub', `The ${count(n)} here are trashed and downloaded again from GitHub.`);
+	}
+
+	/** What happens to files only one side has. Defaults to keeping them. */
+	private renderExtrasChoice(): void {
+		const { localOnly, remoteOnly } = this.result;
+		const group = this.contentEl.createDiv({ cls: 'ultisync-choice' });
+		group.createDiv({ cls: 'ultisync-choice-title', text: 'Files only one side has' });
+
+		const both: string[] = [];
+		if (remoteOnly.length) both.push(`download ${count(remoteOnly.length)} from GitHub`);
+		if (localOnly.length) both.push(`upload ${count(localOnly.length)} from this vault`);
+		this.radio(group, 'extras', 'keep', 'Keep both', `${both.join(' and ')}. Nothing is lost.`, true);
+
+		if (remoteOnly.length) {
+			this.radio(
+				group,
+				'extras',
+				'local-only',
+				'Use only this vault',
+				`Delete the ${count(remoteOnly.length)} that only GitHub has from GitHub.`,
+			);
+		}
+		if (localOnly.length) {
+			this.radio(
+				group,
+				'extras',
+				'remote-only',
+				'Use only GitHub',
+				`Move the ${count(localOnly.length)} that only this vault has to the trash.`,
+			);
+		}
+	}
+
+	private radio(
+		parent: HTMLElement,
+		name: 'winner' | 'extras',
+		value: Winner | ExtrasPolicy,
+		label: string,
+		hint: string,
+		checked = false,
+	): void {
+		const row = parent.createEl('label', { cls: 'ultisync-radio' });
+		const input = row.createEl('input', { type: 'radio' });
+		input.name = `ultisync-${name}`;
+		input.value = value;
+		input.checked = checked;
+		const text = row.createDiv({ cls: 'ultisync-radio-text' });
+		text.createDiv({ cls: 'ultisync-radio-label', text: label });
+		text.createDiv({ cls: 'ultisync-radio-hint', text: hint });
+
+		input.addEventListener('change', () => {
+			if (!input.checked) return;
+			if (name === 'winner') this.winner = value as Winner;
+			else this.extras = value as ExtrasPolicy;
+			this.refreshPrimary();
+		});
+	}
+
+	private decision(): SetupDecision {
+		return { winner: this.winner, extras: this.extras };
+	}
+
+	/**
+	 * The primary button reads as the choice it will carry out: disabled until
+	 * the mandatory question is answered, warning-coloured once the answer
+	 * loses something.
+	 */
+	private refreshPrimary(): void {
+		const button = this.primaryButton;
+		if (!button) return;
+		const decision = this.decision();
+		const ready = isDecided(this.result, decision);
+		button.disabled = !ready;
+		const destructive = ready && isDestructive(planFor(this.result, decision));
+		button.toggleClass('mod-warning', destructive);
+		button.toggleClass('mod-cta', !destructive);
+	}
+
+	private submit(): void {
+		const decision = this.decision();
+		if (!isDecided(this.result, decision)) return;
+		const plan = planFor(this.result, decision);
+		if (!isDestructive(plan)) {
+			this.decide(decision);
+			return;
+		}
+
+		// Everything the choice loses, in one list, before anything moves.
+		const body: string[] = [];
+		const list: string[] = [];
+		if (plan.deleteRemote.length) {
+			body.push(`${count(plan.deleteRemote.length)} will be deleted from GitHub.`);
+			list.push(...plan.deleteRemote.map((path) => `GitHub: ${path}`));
+		}
+		if (plan.trashLocal.length) {
+			body.push(`${count(plan.trashLocal.length)} in this vault will be moved to the trash.`);
+			list.push(...plan.trashLocal.map((path) => `Vault: ${path}`));
+		}
+		if (plan.overwriteLocal.length) {
+			body.push(
+				`${count(plan.overwriteLocal.length)} in this vault will be replaced with GitHub's version. The current copies are trashed first.`,
+			);
+			list.push(...plan.overwriteLocal.map((path) => `Replace: ${path}`));
+		}
+		body.push(
+			"Trashed files follow Obsidian's own setting for deleted files under Files and links. A file deleted from GitHub stays in the repository's history.",
+		);
+
+		new ConfirmModal(
+			this.app,
+			{ title: 'Confirm what will be lost', body, list, confirmLabel: 'Proceed' },
+			(confirmed) => {
+				if (confirmed) this.decide(decision);
+			},
+		).open();
 	}
 
 	/** Shows what is actually different, capped so a big difference stays readable. */
@@ -126,11 +268,11 @@ export class SetupCheckModal extends Modal {
 		}
 	}
 
-	private decide(decision: SetupDecision): void {
+	private decide(outcome: SetupOutcome): void {
 		if (this.resolved) return;
 		this.resolved = true;
 		this.close();
-		this.onDecision(decision);
+		this.onDecision(outcome);
 	}
 
 	onClose(): void {

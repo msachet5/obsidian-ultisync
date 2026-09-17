@@ -11,6 +11,7 @@ import {
 	ActivityEntry,
 	ActivityKind,
 	ConflictRecord,
+	DEEP_VERIFY_INTERVAL_MS,
 	EMPTY_BLOB_SHA,
 	UltiSyncSettings,
 	LARGE_FILE_WARN_BYTES,
@@ -22,6 +23,7 @@ import {
 	PushCountdown,
 	PushTrigger,
 	SELF_WRITE_GRACE_MS,
+	SyncPhase,
 	SyncProgress,
 	SyncStateData,
 	SyncStatus,
@@ -40,13 +42,21 @@ import { ChangeDetector } from './ChangeDetector';
 import { ConflictDetector, IdenticalPaths } from './ConflictDetector';
 import { attemptMerge } from './MergeAttempt';
 import { PullManager } from './PullManager';
-import { PushManager } from './PushManager';
+import { PushManager, PushOptions } from './PushManager';
 import { renamesDeclaredIn } from './RenameRecord';
 import { pathsNeverPulled } from './Verify';
 import { ProgressCallback, SetupCheck, SetupCheckResult } from './SetupCheck';
+import { SetupPlan } from './SetupPlan';
 import { SyncStateStore } from './SyncState';
 
 const DEBUG_LOG_LIMIT = 200;
+
+/**
+ * How long debug lines are allowed to pile up before they reach the disk.
+ * The data file carries the whole tracking table, so writing it per line
+ * turned a chatty push into dozens of full rewrites in a row.
+ */
+const DEBUG_SAVE_DELAY_MS = 750;
 
 /** Ceiling on a rate-limit hold. The hourly budget always resets within this. */
 const MAX_RATE_LIMIT_HOLD_MS = 60 * 60 * 1000;
@@ -141,6 +151,13 @@ export class SyncManager {
 	// When the vault was last checked against the record rather than against
 	// the commit pointer.
 	private lastVerifyAt = 0;
+	private lastDeepVerifyAt = 0;
+
+	// Focus and visibility both announce a return to the app, usually in the
+	// same instant. One check is enough.
+	private activating = false;
+
+	private debugSaveTimer: number | null = null;
 
 	private progress: SyncProgress | null = null;
 	private pushDueAt: number | null = null;
@@ -178,6 +195,11 @@ export class SyncManager {
 		return this.state;
 	}
 
+	/** Whether a transfer or comparison holds the manager right now. */
+	isRunning(): boolean {
+		return this.running;
+	}
+
 	getActivity(): ActivityEntry[] {
 		return this.activity;
 	}
@@ -205,7 +227,7 @@ export class SyncManager {
 	 * and a number that flashes past is worse than no number.
 	 */
 	private reportProgress(
-		phase: 'pull' | 'push',
+		phase: SyncPhase,
 		done: number,
 		total: number,
 		totalBytes: number,
@@ -228,10 +250,28 @@ export class SyncManager {
 		this.onProgress();
 	}
 
+	/**
+	 * Progress for work done outside this manager but shown alongside its own,
+	 * such as a reset clearing the vault before it asks for a pull. Reported
+	 * unconditionally: the caller has decided it is worth watching.
+	 */
+	setProgress(progress: SyncProgress | null): void {
+		if (progress === null) {
+			this.clearProgress();
+			return;
+		}
+		this.progress = progress;
+		this.onProgress();
+	}
+
 	/** A PullManager wired to report where it has got to. */
 	private pullManager(github: GitHubClient): PullManager {
-		return new PullManager(this.app, github, this.settings, (done, total, bytes) =>
-			this.reportProgress('pull', done, total, bytes),
+		return new PullManager(
+			this.app,
+			github,
+			this.settings,
+			(done, total, bytes) => this.reportProgress('pull', done, total, bytes),
+			(path) => this.markSelfWrite(path),
 		);
 	}
 
@@ -295,7 +335,16 @@ export class SyncManager {
 		if (this.state.debugLog.length > DEBUG_LOG_LIMIT) {
 			this.state.debugLog.splice(0, this.state.debugLog.length - DEBUG_LOG_LIMIT);
 		}
-		void this.stateStore.save(this.state);
+		this.scheduleDebugSave();
+	}
+
+	// Every point that matters saves explicitly; the log alone can wait.
+	private scheduleDebugSave(): void {
+		if (this.debugSaveTimer !== null) return;
+		this.debugSaveTimer = window.setTimeout(() => {
+			this.debugSaveTimer = null;
+			void this.stateStore.save(this.state);
+		}, DEBUG_SAVE_DELAY_MS);
 	}
 
 	// Called from the vault's rename event, which is the only place the old and
@@ -341,9 +390,29 @@ export class SyncManager {
 		this.state.pendingRenames[origin] = to;
 	}
 
-	/** Compares this vault against the repository before anything is linked. */
+	/**
+	 * Compares this vault against the repository before anything is linked.
+	 * Holds the manager while it runs, so no poll or push reads the vault
+	 * halfway through the comparison.
+	 */
 	async runSetupCheck(onProgress?: ProgressCallback): Promise<SetupCheckResult> {
-		return new SetupCheck(this.vault, this.getClient(), this.settings).run(onProgress);
+		if (this.running) {
+			throw new Error('UltiSync is busy. Try again when the current operation finishes.');
+		}
+		this.running = true;
+		try {
+			return await new SetupCheck(this.vault, this.getClient(), this.settings).run(
+				(progress) => {
+					// Sized by the bytes it has to read: a comparison that reads
+					// nothing is over before a count could be read.
+					this.reportProgress('check', progress.done, progress.total, progress.totalBytes);
+					onProgress?.(progress);
+				},
+			);
+		} finally {
+			this.running = false;
+			this.clearProgress();
+		}
 	}
 
 	private get syncEnabled(): boolean {
@@ -384,19 +453,29 @@ export class SyncManager {
 
 	async onActivation(): Promise<void> {
 		if (!this.syncEnabled) return;
+		if (this.activating) return;
 		const last = this.state.lastRemoteCheck ? Date.parse(this.state.lastRemoteCheck) : 0;
 		if (Date.now() - last < PULL_INTERVAL_MS) {
 			return;
 		}
-		await this.checkRemote();
 
-		// A device that has been away is the one most likely to have missed
-		// something, and the least likely to be in the middle of anything.
-		if (this.running) return;
+		this.activating = true;
 		try {
-			await this.deepVerify();
-		} catch (error) {
-			this.handleError(error);
+			await this.checkRemote();
+
+			// A device that has been away is the one most likely to have missed
+			// something, and the least likely to be in the middle of anything.
+			// Rate-limited all the same: a window clicked in and out of every
+			// few seconds should not pay for a tree read each time.
+			if (this.running) return;
+			if (Date.now() - this.lastDeepVerifyAt < DEEP_VERIFY_INTERVAL_MS) return;
+			try {
+				await this.deepVerify();
+			} catch (error) {
+				this.handleError(error);
+			}
+		} finally {
+			this.activating = false;
 		}
 	}
 
@@ -406,119 +485,134 @@ export class SyncManager {
 		return !this.state.lastSyncedCommit;
 	}
 
-	// "Upload this vault." Adopts the remote's current position without
-	// downloading anything, then pushes. Every local file is untracked at this
-	// point, so the push carries all of them; remote-only files are untouched on
-	// GitHub and arrive with the next ordinary pull.
-	async adoptLocal(): Promise<void> {
+	/**
+	 * Links this vault to the repository by carrying out the plan the user
+	 * chose from the setup comparison, in the one order that never loses a
+	 * file by accident:
+	 *
+	 * 1. Files the comparison proved identical are recorded as synced; nothing
+	 *    moves for them.
+	 * 2. Whatever GitHub wins is downloaded, trashing the local loser first.
+	 * 3. Files the user chose to drop from this vault are trashed.
+	 * 4. The remote position is recorded.
+	 * 5. Whatever this vault wins is pushed, in one commit that also removes
+	 *    the files the user chose to drop from GitHub.
+	 *
+	 * Anything that goes wrong before the position is recorded leaves the
+	 * vault unlinked, so the next attempt starts from the comparison again
+	 * rather than from a half-recorded state.
+	 */
+	async adopt(result: SetupCheckResult, plan: SetupPlan): Promise<void> {
 		if (this.running) return;
 		this.running = true;
-		this.setStatus('pushing', 'Uploading this vault...');
+		this.setStatus('syncing', 'Linking to GitHub...');
 		try {
 			const github = this.getClient();
-			const ref = await github.getBranchReference(true);
-			const commit = await github.getCommit(ref.object.sha);
-			const remote = await github.readTreeSnapshot(commit.sha, commit.tree.sha);
+			const ref = await github.getBranchReferenceOrNull(true);
+			const remote: RemoteSnapshot = ref
+				? await (async () => {
+						const commit = await github.getCommit(ref.object.sha);
+						return github.readTreeSnapshot(commit.sha, commit.tree.sha);
+					})()
+				: { commitSha: '', treeSha: '', entries: new Map() };
 
-			this.state.lastSyncedCommit = remote.commitSha;
-			this.state.lastSyncedTree = treeMapOf(remote);
-			await this.stateStore.save(this.state);
+			// 1. Identical on both sides, as the comparison found. Checked
+			// against the tree read just now, in case GitHub moved in between.
+			for (const [path, proof] of Object.entries(result.identical)) {
+				if (remote.entries.get(path)?.sha !== proof.remoteSha) continue;
+				const file = this.vault.getAbstractFileByPath(path);
+				this.state.trackedFiles[path] = {
+					localHash: proof.localHash,
+					remoteSha: proof.remoteSha,
+					...(file instanceof TFile ? { mtime: file.stat.mtime, size: file.stat.size } : {}),
+				};
+			}
 
-			await this.performPush('adopt');
-
-			// The push above sent this vault. Anything that exists only on
-			// GitHub was recorded as synced without ever being downloaded, and
-			// waiting for "the next ordinary pull" to collect it is what left
-			// devices permanently short of files: the push this vault just made
-			// is the commit it will compare against from now on, so the remote
-			// never appears to move and no pull is ever triggered.
-			const recovered = await this.verifyNow();
-			new Notice(
-				recovered
-					? `UltiSync: this vault is now the starting point, and ${recovered} file(s) only on GitHub were downloaded.`
-					: 'UltiSync: this vault is now the starting point.',
-			);
-		} catch (error) {
-			this.state.lastSyncedCommit = null;
-			this.state.lastSyncedTree = {};
-			await this.stateStore.save(this.state);
-			this.handleError(error);
-		} finally {
-			this.running = false;
-			this.clearProgress();
-		}
-	}
-
-	// "Download from GitHub." Overwrites this vault's copies with the remote's.
-	// Files that exist only locally are left alone: this replaces what both
-	// sides have, it does not empty the vault.
-	async adoptRemote(): Promise<void> {
-		if (this.running) return;
-		this.running = true;
-		this.setStatus('pulling', 'Downloading from GitHub...');
-		try {
-			const github = this.getClient();
-			const ref = await github.getBranchReference(true);
-			const commit = await github.getCommit(ref.object.sha);
-			const remote = await github.readTreeSnapshot(commit.sha, commit.tree.sha);
-
+			// 2. GitHub's winners come down. The pull manager marks each write
+			// as the plugin's own as it happens.
 			const pull = this.pullManager(github);
-			const result = await pull.adoptRemote(remote, this.state, (paths) =>
-				confirmWithModal(this.app, {
-					title: 'Replace local files with the GitHub versions?',
-					body: [
-						`${paths.length} file(s) in this vault differ from GitHub and will be replaced.`,
-						"The current versions are trashed first, following Obsidian's own setting for deleted files.",
-					],
-					list: paths,
-					confirmLabel: 'Replace',
-				}),
-			);
-
-			if (result.cancelled) {
-				new Notice('UltiSync: cancelled. Nothing was changed.');
-				this.setStatus('pending', 'No starting point chosen yet.');
-				return;
+			const toPull = plan.pull.filter((path) => remote.entries.has(path));
+			let pulled = 0;
+			if (toPull.length) {
+				this.setStatus('pulling', `Downloading ${toPull.length} file(s) from GitHub...`);
+				for (const path of plan.overwriteLocal) {
+					const file = this.vault.getAbstractFileByPath(path);
+					if (!(file instanceof TFile)) continue;
+					this.markSelfWrite(path);
+					await this.app.fileManager.trashFile(file);
+				}
+				const applied = await pull.applyRemoteChanges(remote, this.state, toPull, []);
+				pulled = applied.pulled;
 			}
 
+			// 3. The vault's extras, when the user chose GitHub as the whole
+			// truth. Each is marked as it goes; a mark made up front lapses
+			// before a long list is through.
+			let trashed = 0;
+			if (plan.trashLocal.length) {
+				const total = plan.trashLocal.length;
+				this.setStatus('syncing', `Moving ${total} file(s) to the trash...`);
+				this.setProgress({ phase: 'clear', done: 0, total });
+				for (const path of plan.trashLocal) {
+					const file = this.vault.getAbstractFileByPath(path);
+					if (file instanceof TFile) {
+						this.markSelfWrite(path);
+						await this.app.fileManager.trashFile(file);
+						delete this.state.trackedFiles[path];
+						trashed++;
+					}
+					this.setProgress({ phase: 'clear', done: trashed, total });
+				}
+				this.clearProgress();
+			}
+
+			// 4. From here on the vault is linked. The files about to be removed
+			// from GitHub leave the record now, so nothing between here and the
+			// push can read them as files this vault has yet to fetch.
 			const now = new Date().toISOString();
-			this.state.lastSyncedCommit = remote.commitSha;
-			this.state.lastSyncedTree = treeMapOf(remote);
-			this.state.lastSuccessfulPull = now;
+			const tree = treeMapOf(remote);
+			for (const path of plan.deleteRemote) delete tree[path];
+			this.state.lastSyncedCommit = remote.commitSha || null;
+			this.state.lastSyncedTree = tree;
 			this.state.lastRemoteCheck = now;
+			if (pulled) this.state.lastSuccessfulPull = now;
 			await this.stateStore.save(this.state);
 
-			// The download replaced what both sides had and left files that exist
-			// only here exactly where they were. Nothing would notice them until
-			// somebody typed, so they are queued now rather than waiting for an
-			// edit that might never come.
-			const detector = new ChangeDetector(this.vault, this.settings);
-			const local = await detector.detectLocalChanges(
-				this.state,
-				this.settings.pushExtensions,
-				this.userNamed,
-			);
-			const outgoing = local.modifiedOrCreated.size;
-
-			this.dirty = outgoing > 0;
-			if (outgoing) {
-				this.record('info', `${outgoing} file(s) here are not on GitHub yet`);
-				this.scheduleDebouncedPush();
+			// 5. This vault's winners go up, and GitHub's extras go if asked.
+			// The push finds every untracked local file itself; the seeding
+			// above is what keeps it from re-reading the identical ones.
+			let pushed = false;
+			if (plan.push || remote.commitSha === '') {
+				this.setStatus('pushing', 'Uploading this vault...');
+				pushed = await this.performPush('adopt', {
+					forceOverwrite: true,
+					deletePaths: plan.deleteRemote,
+				});
+			} else {
+				this.dirty = false;
+				this.setStatus('synced', 'Linked to GitHub.');
 			}
 
-			this.setStatus(
-				outgoing ? 'pending' : 'synced',
-				outgoing
-					? `Downloaded ${result.pulled} file(s). ${outgoing} to upload.`
-					: `Downloaded ${result.pulled} file(s).`,
-			);
+			// The position recorded in step 4 is the one the push built on, so
+			// anything only GitHub has that the plan kept was fetched in step
+			// 2. This is the safety net for a remote that moved in between.
+			const recovered = await this.verifyNow();
+
+			const parts: string[] = [];
+			if (pulled + recovered) parts.push(`downloaded ${pulled + recovered} file(s)`);
+			if (trashed) parts.push(`trashed ${trashed} file(s) here`);
+			if (pushed) parts.push('uploaded this vault');
+			if (plan.deleteRemote.length) parts.push(`removed ${plan.deleteRemote.length} file(s) from GitHub`);
+			this.record('info', parts.length ? `Linked to GitHub: ${parts.join(', ')}` : 'Linked to GitHub');
 			new Notice(
-				outgoing
-					? `UltiSync: downloaded ${result.pulled} file(s) from GitHub. ${outgoing} file(s) only in this vault will be uploaded next.`
-					: `UltiSync: downloaded ${result.pulled} file(s) from GitHub.`,
+				parts.length
+					? `UltiSync: linked to GitHub — ${parts.join(', ')}.`
+					: 'UltiSync: linked to GitHub. Everything already matched.',
 			);
 			this.refreshUI();
 		} catch (error) {
+			// Unlinked again, so the next attempt runs the comparison afresh
+			// rather than trusting a position that was never fully applied.
 			this.state.lastSyncedCommit = null;
 			this.state.lastSyncedTree = {};
 			await this.stateStore.save(this.state);
@@ -697,7 +791,7 @@ export class SyncManager {
 			return;
 		}
 
-		const comparison = await github.compareCommits(this.state.lastSyncedCommit, remoteHead);
+		const comparison = await this.compareOrDiverged(github, this.state.lastSyncedCommit, remoteHead);
 		const relation = comparison.status;
 
 		// A head that is behind or identical is a stale read, not a branch that
@@ -722,6 +816,31 @@ export class SyncManager {
 		);
 	}
 
+	/**
+	 * How the remote head relates to the synced commit, with one answer for a
+	 * commit GitHub no longer knows: "diverged". That happens when history was
+	 * rewritten under this vault, or when a read lands on a replica that has
+	 * not seen the commit yet. Either way the tree is still worth reconciling,
+	 * with deletions withheld, and neither is a reason to switch sync off —
+	 * which is what a bare 404 used to do.
+	 */
+	private async compareOrDiverged(
+		github: GitHubClient,
+		baseSha: string,
+		headSha: string,
+	): Promise<{ status: string; commits: { sha: string; message: string }[] }> {
+		try {
+			return await github.compareCommits(baseSha, headSha);
+		} catch (error) {
+			if (!(error instanceof GitHubApiError) || error.status !== 404) throw error;
+			this.debug(
+				`compare ${baseSha.slice(0, 12)}...${headSha.slice(0, 12)} answered 404; treating as diverged`,
+			);
+			github.invalidateBranchCache();
+			return { status: 'diverged', commits: [] };
+		}
+	}
+
 	private async pushInternal(): Promise<void> {
 		if (!this.state.lastSyncedCommit) {
 			throw new Error('Complete an initial pull before pushing.');
@@ -739,13 +858,16 @@ export class SyncManager {
 	// push. Withholding them on an automatic push and telling the user to press
 	// Push instead only worked while that button was available, and it is
 	// disabled precisely when synchronization is on.
-	async performPush(trigger: PushTrigger = 'automatic'): Promise<void> {
+	async performPush(
+		trigger: PushTrigger = 'automatic',
+		adoption: Pick<PushOptions, 'forceOverwrite' | 'deletePaths'> = {},
+	): Promise<boolean> {
 		// Nothing automatic runs while a push is in flight, however long it takes.
 		this.syncHoldUntil = Date.now() + POLL_HOLD_AFTER_PUSH_MS;
 
 		let landed: string | null = null;
 		try {
-			landed = await this.performPushInternal(trigger);
+			landed = await this.performPushInternal(trigger, adoption);
 		} finally {
 			// The settling period counts from the moment the push actually
 			// finished. Arming it only at the start left a long push clear to be
@@ -754,6 +876,7 @@ export class SyncManager {
 		}
 
 		if (landed) await this.waitForBranchToCatchUp(landed);
+		return landed !== null;
 	}
 
 	/**
@@ -796,14 +919,19 @@ export class SyncManager {
 	}
 
 	/** Returns the commit this push created, or null when nothing was pushed. */
-	private async performPushInternal(trigger: PushTrigger): Promise<string | null> {
+	private async performPushInternal(
+		trigger: PushTrigger,
+		adoption: Pick<PushOptions, 'forceOverwrite' | 'deletePaths'>,
+	): Promise<string | null> {
 		const github = this.getClient();
 		const push = this.pushManager(github);
 
 		const result = await push.push(this.state, {
-			// Adoption is the one push that must not delete: nothing was tracked
-			// before it, so every absence is meaningless rather than intentional.
+			// Adoption is the one push that must not infer deletions: nothing
+			// was tracked before it, so every absence is meaningless rather than
+			// intentional. The ones it does carry were chosen by name.
 			includeDeletions: trigger !== 'adopt',
+			...adoption,
 			userNamed: this.userNamed,
 			confirmDeletions: (paths, reason) =>
 				confirmWithModal(this.app, {
@@ -864,8 +992,9 @@ export class SyncManager {
 
 			// Only advance the synced position when the push started from the
 			// commit this vault already knew about. Otherwise the next pull has to
-			// reconcile the difference.
-			if (result.remote?.commitSha === this.state.lastSyncedCommit) {
+			// reconcile the difference. A first commit into an empty repository
+			// started from nothing, which is exactly what an unlinked vault knew.
+			if (result.remote?.commitSha === (this.state.lastSyncedCommit ?? '')) {
 				this.state.lastSyncedCommit = result.commitSha;
 				const tree = treeMapOf(result.remote);
 				for (const path of result.deletedPaths) delete tree[path];
@@ -1655,6 +1784,7 @@ export class SyncManager {
 		}
 
 		this.lastVerifyAt = Date.now();
+		this.lastDeepVerifyAt = Date.now();
 	}
 
 	/** Free when it finds nothing, which is the ordinary case. */
@@ -1797,8 +1927,28 @@ export class SyncManager {
 		// it, so the plugin stops and says so rather than failing every five
 		// seconds until someone notices.
 		if (requiresUserAction(error)) {
-			this.onRequiresAttention(message);
+			void this.stopIfUnreachable(error, message);
 		}
+	}
+
+	/**
+	 * A 401 is final. A 404 is only final when the repository itself answers
+	 * it: GitHub also says 404 for a commit a replica has not seen yet, or one
+	 * that history was rewritten away from, and neither is fixed by a person
+	 * retyping a token. So the branch is read once more before sync is
+	 * switched off on the strength of a 404.
+	 */
+	private async stopIfUnreachable(error: unknown, message: string): Promise<void> {
+		if (error instanceof GitHubApiError && error.status === 404) {
+			try {
+				await this.getClient().getBranchReferenceOrNull(true);
+				this.debug('404 was not the repository; leaving sync on');
+				return;
+			} catch {
+				// The repository really is out of reach. Fall through.
+			}
+		}
+		this.onRequiresAttention(message);
 	}
 
 	/** Called once anything succeeds, so the next failure is announced again. */
@@ -1812,6 +1962,11 @@ export class SyncManager {
 		if (this.pushTimer) {
 			window.clearTimeout(this.pushTimer);
 			this.pushTimer = null;
+		}
+		if (this.debugSaveTimer !== null) {
+			window.clearTimeout(this.debugSaveTimer);
+			this.debugSaveTimer = null;
+			void this.stateStore.save(this.state);
 		}
 		this.clearPushCountdown();
 		this.clearProgress();

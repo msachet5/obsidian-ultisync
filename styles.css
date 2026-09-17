@@ -518,3 +518,101 @@
   font-size: var(--font-ui-smaller);
   color: var(--text-muted);
 }
+
+/* ---------------------------------------------------------------------------
+   Working buttons
+   Push and Reset can run for minutes on a big vault. The button itself fills
+   from the left as the count advances, and slides while there is no count yet,
+   so the person who pressed it can see it working without leaving settings.
+   --------------------------------------------------------------------------- */
+
+.ultisync-action {
+  min-width: 11em;
+  font-variant-numeric: tabular-nums;
+}
+
+.ultisync-action.ultisync-working {
+  --ultisync-fill: 0%;
+  cursor: progress;
+  background-image: linear-gradient(var(--interactive-accent), var(--interactive-accent));
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--interactive-accent) 55%, transparent),
+    color-mix(in srgb, var(--interactive-accent) 55%, transparent)
+  );
+  background-repeat: no-repeat;
+  background-size: var(--ultisync-fill) 100%;
+  transition: background-size 150ms linear;
+}
+
+/* Nothing to count yet: a band drifts across instead of a fill creeping up. */
+.ultisync-action.ultisync-working.ultisync-indeterminate {
+  background-size: 40% 100%;
+  animation: ultisync-slide 1.2s ease-in-out infinite;
+}
+
+@keyframes ultisync-slide {
+  0%   { background-position: -60% 0; }
+  100% { background-position: 160% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ultisync-action.ultisync-working.ultisync-indeterminate {
+    animation: none;
+    background-size: 100% 100%;
+  }
+}
+
+/* setDisabled() dims the button; a working one should stay fully legible. */
+.ultisync-action.ultisync-working:disabled,
+.ultisync-action.ultisync-working.is-disabled {
+  opacity: 1;
+}
+
+/* ---------------------------------------------------------------------------
+   Setup comparison: the two questions
+   --------------------------------------------------------------------------- */
+
+.ultisync-setup-modal {
+  max-width: min(640px, 92vw);
+}
+
+.ultisync-choice {
+  margin: 0 0 1em;
+  padding: 0.7em 0.9em;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+}
+
+.ultisync-choice-title {
+  font-weight: var(--font-medium);
+  margin-bottom: 0.4em;
+}
+
+.ultisync-radio {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.7em;
+  padding: 0.35em 0.2em;
+  cursor: pointer;
+  border-radius: var(--radius-s);
+}
+
+.ultisync-radio:hover {
+  background: var(--background-modifier-hover);
+}
+
+.ultisync-radio input {
+  margin-top: 0.25em;
+  flex: none;
+}
+
+.ultisync-radio-label {
+  color: var(--text-normal);
+}
+
+.ultisync-radio-hint {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.4;
+}

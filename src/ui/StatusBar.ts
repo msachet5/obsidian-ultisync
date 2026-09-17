@@ -1,5 +1,6 @@
 import { Plugin, Workspace } from 'obsidian';
 import {
+	PHASE_VERB,
 	PushCountdown,
 	SyncProgress,
 	SyncStatus,
@@ -32,11 +33,6 @@ const WORDS: Record<SyncStatus, string> = {
 	pushing: 'Pushing',
 	conflict: 'Conflict',
 	error: 'UltiSync not working',
-};
-
-const PHASE_VERB: Record<SyncProgress['phase'], string> = {
-	pull: 'Pulling',
-	push: 'Pushing',
 };
 
 export class StatusBarController {
@@ -102,7 +98,8 @@ export class StatusBarController {
 		if (!this.progress) return ICONS[this.status];
 
 		const { done, total, phase } = this.progress;
-		return `${phase === 'pull' ? '↓' : '↑'} ${done}/${total}`;
+		const glyph = phase === 'pull' ? '↓' : phase === 'push' ? '↑' : '↻';
+		return `${glyph} ${done}/${total}`;
 	}
 
 	private title(): string {

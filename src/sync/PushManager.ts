@@ -36,6 +36,18 @@ export interface PushOptions {
 	/** Paths the user renamed themselves, exempt from the new-file settle delay. */
 	userNamed?: Set<string>;
 	/**
+	 * Sends an untracked local file as it is even when GitHub holds a
+	 * different version, instead of merging or reporting a collision. Only the
+	 * adoption push sets this: the setup check has just shown the user exactly
+	 * which files differ, and they chose this vault as the winner.
+	 */
+	forceOverwrite?: boolean;
+	/**
+	 * Paths to remove from GitHub in this commit whatever the vault holds.
+	 * Already confirmed by whoever asked, so they bypass the deletion screen.
+	 */
+	deletePaths?: string[];
+	/**
 	 * Asked before a batch of deletions is sent. "empty-index" is the more
 	 * alarming case: the vault reports nothing at all, which usually means it
 	 * has not finished loading rather than that everything was deleted.
@@ -409,7 +421,9 @@ export class PushManager {
 			const remoteIsUnknown =
 				remoteEntry !== undefined && (!tracked || tracked.remoteSha !== remoteEntry.sha);
 
-			if (remoteIsUnknown) {
+			if (remoteIsUnknown && options.forceOverwrite) {
+				trace.push(`${path}: differs from GitHub, sent as-is (this vault chosen as winner)`);
+			} else if (remoteIsUnknown) {
 				const outcome = await attemptMerge(this.github, path, bytes, tracked, remoteEntry);
 				if (!outcome) {
 					collisions.push(path);
@@ -529,6 +543,21 @@ export class PushManager {
 			} else {
 				withheldDeletions.push(...candidateDeletions);
 			}
+		}
+
+		// Deletions the caller decided on, not ones the vault implied. They are
+		// screened by whoever asked for them, so they go straight in.
+		const queued = new Set(entries.map((entry) => entry.path));
+		for (const path of options.deletePaths ?? []) {
+			if (queued.has(path)) continue;
+			if (!remote.entries.has(path)) {
+				trace.push(`${path}: asked to delete, already absent on remote`);
+				continue;
+			}
+			trace.push(`${path}: deleted on request`);
+			entries.push({ path, mode: FILE_MODE, type: 'blob', sha: null });
+			deletedPaths.push(path);
+			queued.add(path);
 		}
 
 		const deferredUntil = detected.deferred.size

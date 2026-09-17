@@ -17,6 +17,13 @@ export const PROGRESS_MIN_BYTES = 25 * 1024 * 1024;
  */
 export const VERIFY_INTERVAL_MS = 60000;
 
+/**
+ * How often the thorough check runs at most. It costs a tree read, and a
+ * window that is clicked in and out of every few seconds should not pay that
+ * each time; a device that has been away for a while still gets it.
+ */
+export const DEEP_VERIFY_INTERVAL_MS = 5 * 60 * 1000;
+
 /** How often the progress bar and the push countdown are repainted. Fast
  *  enough that a five-second ring drains smoothly, cheap enough to run while
  *  nothing is happening: the paint returns immediately when both are idle. */
@@ -201,10 +208,23 @@ export type SyncStatus =
  * the byte totals say.
  */
 export interface SyncProgress {
-	phase: 'pull' | 'push';
+	phase: SyncPhase;
 	done: number;
 	total: number;
 }
+
+/**
+ * What a transfer is doing. "check" is the setup comparison hashing files it
+ * has to read, "clear" is a reset trashing the local copies before it pulls.
+ */
+export type SyncPhase = 'pull' | 'push' | 'check' | 'clear';
+
+export const PHASE_VERB: Record<SyncPhase, string> = {
+	pull: 'Pulling',
+	push: 'Pushing',
+	check: 'Checking',
+	clear: 'Clearing',
+};
 
 /** A push waiting out the debounce window, and how much of it is left. */
 export interface PushCountdown {

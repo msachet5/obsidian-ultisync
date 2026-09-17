@@ -8,18 +8,12 @@ import {
 	matchesExtensions,
 	normalizePath,
 } from '../vault/PathFilter';
-import { base64ToArrayBuffer, gitBlobSha, sha256 } from '../vault/VaultScanner';
+import { base64ToArrayBuffer, sha256 } from '../vault/VaultScanner';
 
 export interface ApplyResult {
 	pulled: number;
 	deletedPaths: Set<string>;
 	trace: string[];
-}
-
-export interface AdoptResult {
-	pulled: number;
-	replaced: number;
-	cancelled: boolean;
 }
 
 /** Blobs per round of downloads. Small enough that a large pull never holds
@@ -35,6 +29,13 @@ export class PullManager {
 		 *  byte total is what decides whether it is worth saying at all. */
 		private onProgress: (done: number, total: number, totalBytes: number) => void = () =>
 			undefined,
+		/**
+		 * Called with a path immediately before this manager writes, moves or
+		 * trashes it. The vault event that follows must be recognised as the
+		 * plugin's own, and a mark made at the start of a long pull has lapsed
+		 * by the time the hundredth file lands.
+		 */
+		private onBeforeWrite: (path: string) => void = () => undefined,
 	) {}
 
 	private get vault(): Vault {
@@ -45,6 +46,7 @@ export class PullManager {
 	// follows the vault's own "Deleted files" preference, so a file this plugin
 	// removes ends up wherever Obsidian would have put it.
 	private async trash(file: TFile): Promise<void> {
+		this.onBeforeWrite(file.path);
 		await this.app.fileManager.trashFile(file);
 	}
 
@@ -86,53 +88,6 @@ export class PullManager {
 		}
 
 		return { pulled, deletedPaths, trace };
-	}
-
-	// Used once, when the user chooses GitHub as the starting point on a vault
-	// that already holds files. Unlike performInitialPull this does not refuse to
-	// overwrite, because the user has explicitly asked for the remote to win, but
-	// the versions it replaces are trashed rather than destroyed, and files that
-	// exist only locally are left completely alone.
-	//
-	// The confirmation is asked for asynchronously because it is a modal now,
-	// and a modal cannot answer before the frame it is opened in has ended.
-	async adoptRemote(
-		remote: RemoteSnapshot,
-		state: SyncStateData,
-		confirmOverwrite: (paths: string[]) => Promise<boolean>,
-	): Promise<AdoptResult> {
-		if (this.settings.pullExtensions.length === 0) {
-			throw new Error('Select at least one pull extension first.');
-		}
-
-		const paths = Array.from(remote.entries.keys()).filter((path) =>
-			this.isPullable(path, remote),
-		);
-
-		const differing: string[] = [];
-		for (const path of paths) {
-			const file = this.vault.getAbstractFileByPath(normalizePath(path));
-			if (!(file instanceof TFile)) continue;
-			const entry = remote.entries.get(path);
-			if (!entry?.sha) continue;
-			if ((await gitBlobSha(await this.vault.readBinary(file))) !== entry.sha) {
-				differing.push(path);
-			}
-		}
-
-		if (differing.length && !(await confirmOverwrite(differing))) {
-			return { pulled: 0, replaced: 0, cancelled: true };
-		}
-
-		for (const path of differing) {
-			const file = this.vault.getAbstractFileByPath(normalizePath(path));
-			if (file instanceof TFile) {
-				await this.trash(file);
-			}
-		}
-
-		const pulled = await this.downloadAndWrite(paths, remote, state);
-		return { pulled, replaced: differing.length, cancelled: false };
 	}
 
 	/**
@@ -267,6 +222,7 @@ export class PullManager {
 	private async writeBinaryFile(path: string, bytes: ArrayBuffer): Promise<void> {
 		const normalized = normalizePath(path);
 		await this.ensureParentFolder(normalized);
+		this.onBeforeWrite(normalized);
 
 		const existing = this.vault.getAbstractFileByPath(normalized);
 		if (existing instanceof TFile) {

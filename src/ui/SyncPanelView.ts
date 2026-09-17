@@ -2,6 +2,7 @@ import { ItemView, WorkspaceLeaf, setIcon } from 'obsidian';
 import {
 	ActivityEntry,
 	ActivityKind,
+	PHASE_VERB,
 	PushCountdown,
 	SyncProgress,
 	SyncStateData,
@@ -25,11 +26,6 @@ export interface PanelHost {
 	openConflicts(): void;
 	openSettings(): void;
 }
-
-const PHASE_VERB: Record<SyncProgress['phase'], string> = {
-	pull: 'Pulling',
-	push: 'Pushing',
-};
 
 const STATUS_COPY: Record<SyncStatus, { label: string; hint: string }> = {
 	setup: { label: 'Not set up', hint: 'No repository connected yet.' },

@@ -11,9 +11,12 @@ import type { SettingDefinitionItem, SettingDefinitionRender } from 'obsidian';
 import {
 	ConnectionState,
 	UltiSyncSettings,
+	PHASE_VERB,
 	PUSH_DELAY_SECONDS,
 	SUPPORTED_EXTENSIONS,
+	SyncProgress,
 	SyncStatus,
+	progressPercent,
 } from '../types';
 import { devicePlatform } from '../platform';
 import { usesSecretStorage } from '../TokenStore';
@@ -38,11 +41,27 @@ export interface SettingsHost {
 	getConnectionState(): ConnectionState;
 	/** Asks before clearing credentials and sync bookkeeping. */
 	confirmReset(): void;
+	/** Resolves once the push, and any linking it needed first, is over. */
 	pushNow(): Promise<void>;
 	resetSyncState(): Promise<void>;
 	getDeviceId(): string;
 	getStatus(): { status: SyncStatus; detail?: string };
+	/** How far the transfer in flight has got, or null when it has no count. */
+	getProgress(): SyncProgress | null;
+	/** Whether a transfer or comparison is running, whoever started it. */
+	isBusy(): boolean;
 }
+
+/** The two long-running actions, which show their progress in their button. */
+type Action = 'push' | 'reset';
+
+const ACTION_LABEL: Record<Action, { idle: string; busy: string }> = {
+	push: { idle: 'Push', busy: 'Pushing' },
+	reset: { idle: 'Reset and re-pull', busy: 'Resetting' },
+};
+
+/** How often a working button is repainted while nothing else drives it. */
+const BUTTON_TICK_MS = 100;
 
 /**
  * One row of the tab, described once and rendered by either path: Obsidian
@@ -103,6 +122,13 @@ export class SettingsTab extends PluginSettingTab {
 	// past the component and clearing the disabled property alone leaves a
 	// button that looks enabled and cannot be clicked.
 	private saveButton: ButtonComponent | null = null;
+
+	// The action in flight, and the buttons that show it. Held on the tab
+	// rather than the row: the tab survives a redraw, the row does not, and a
+	// push that started before the settings were reopened is still running.
+	private action: Action | null = null;
+	private actionButtons: Partial<Record<Action, ButtonComponent>> = {};
+	private actionTimer: number | null = null;
 
 	constructor(
 		app: App,
@@ -217,7 +243,68 @@ export class SettingsTab extends PluginSettingTab {
 	/** State both paths reset before they lay the tab out again. */
 	private beginRender(): void {
 		this.saveButton = null;
+		this.actionButtons = {};
 		this.draft = this.saving ? this.draft : this.draftFromSettings();
+	}
+
+	/**
+	 * Repaints the working button where it stands. Driven by the plugin's
+	 * progress tick while a count is live, and by the tab's own timer for the
+	 * stretches when there is none, so the button never freezes mid-word.
+	 */
+	paintProgress(): void {
+		const progress = this.host.getProgress();
+		// Work that started elsewhere is not shown here; a click during it is
+		// answered with a notice instead. Disabling for it would need a repaint
+		// when it ends, and nothing announces that for a small transfer.
+		const disabled = !this.host.hasCredentials() || this.action !== null;
+
+		for (const [key, button] of Object.entries(this.actionButtons)) {
+			const action = key as Action;
+			const el = button.buttonEl;
+			const active = this.action === action;
+
+			button.setDisabled(disabled);
+
+			el.toggleClass('ultisync-working', active);
+			if (!active) {
+				el.removeClass('ultisync-indeterminate');
+				el.style.removeProperty('--ultisync-fill');
+				button.setButtonText(ACTION_LABEL[action].idle);
+				continue;
+			}
+
+			if (progress) {
+				const percent = progressPercent(progress);
+				el.removeClass('ultisync-indeterminate');
+				el.style.setProperty('--ultisync-fill', `${percent}%`);
+				button.setButtonText(
+					`${PHASE_VERB[progress.phase]} ${progress.done}/${progress.total}`,
+				);
+			} else {
+				el.addClass('ultisync-indeterminate');
+				el.style.removeProperty('--ultisync-fill');
+				button.setButtonText(`${ACTION_LABEL[action].busy}…`);
+			}
+		}
+	}
+
+	/** Runs one action with its button showing the work, start to finish. */
+	private async runAction(action: Action, run: () => Promise<void>): Promise<void> {
+		if (this.action !== null || this.host.isBusy()) return;
+		this.action = action;
+		this.actionTimer = window.setInterval(() => this.paintProgress(), BUTTON_TICK_MS);
+		this.paintProgress();
+		try {
+			await run();
+		} finally {
+			this.action = null;
+			if (this.actionTimer !== null) {
+				window.clearInterval(this.actionTimer);
+				this.actionTimer = null;
+			}
+			this.redraw();
+		}
 	}
 
 	/**
@@ -620,23 +707,22 @@ export class SettingsTab extends PluginSettingTab {
 	// ---------------------------------------------------------------------
 
 	private dangerZoneRows(): RowSpec[] {
-		const syncing = this.host.settings.syncEnabled;
-
 		return [
 			{
 				name: 'Push',
-				desc: syncing
-					? 'Not needed while Sync is on: edits go out automatically a few seconds after you stop typing. Only files matching Push extensions are ever sent.'
-					: 'Sends this vault to GitHub now: new files, edits, renames and deletions. Only files matching Push extensions are sent, and ignored paths are skipped. A large batch of deletions is confirmed first.',
+				desc: this.pushDescription(),
+				aliases: ['upload', 'send'],
 				build: (setting) =>
 					setting.addButton((button) => {
+						this.actionButtons.push = button;
 						button
-							.setButtonText(syncing ? 'Syncing automatically' : 'Push')
-							.setDisabled(syncing)
+							.setWarning()
+							.setButtonText(ACTION_LABEL.push.idle)
 							.onClick(() => {
-								void this.host.pushNow();
+								void this.runAction('push', () => this.host.pushNow());
 							});
-						if (!syncing) button.setWarning();
+						button.buttonEl.addClass('ultisync-action');
+						this.paintProgress();
 					}),
 			},
 			{
@@ -644,17 +730,27 @@ export class SettingsTab extends PluginSettingTab {
 				desc: this.resetDescription(),
 				aliases: ['start over', 'redownload'],
 				build: (setting) =>
-					setting.addButton((button) =>
+					setting.addButton((button) => {
+						this.actionButtons.reset = button;
 						button
 							.setWarning()
-							.setButtonText('Reset and re-pull')
-							.onClick(async () => {
-								await this.host.resetSyncState();
-								this.redraw();
-							}),
-					),
+							.setButtonText(ACTION_LABEL.reset.idle)
+							.onClick(() => {
+								void this.runAction('reset', () => this.host.resetSyncState());
+							});
+						button.buttonEl.addClass('ultisync-action');
+						this.paintProgress();
+					}),
 			},
 		];
+	}
+
+	private pushDescription(): string {
+		const always =
+			'Sends this vault to GitHub now: new files, edits, renames and deletions. Only files matching Push extensions are sent, ignored paths are skipped, and a large batch of deletions is confirmed first. Works with Sync on or off.';
+		return this.host.settings.syncEnabled
+			? `${always} With Sync on this is rarely needed: edits go out by themselves a few seconds after you stop typing.`
+			: `${always} If this vault has never been linked, it is compared with GitHub first and you choose the starting point.`;
 	}
 
 	private resetDescription(): string {

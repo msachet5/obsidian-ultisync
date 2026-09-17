@@ -2,7 +2,7 @@ import { TFile, Vault } from 'obsidian';
 import { GitHubClient, RemoteSnapshot } from '../github/GitHubClient';
 import { UltiSyncSettings } from '../types';
 import { isIgnoredPath, matchesExtensions, normalizePath } from '../vault/PathFilter';
-import { gitBlobSha } from '../vault/VaultScanner';
+import { gitBlobSha, sha256 } from '../vault/VaultScanner';
 
 /**
  * How this vault stands against the repository, before anything is linked.
@@ -29,6 +29,12 @@ export interface SetupCheckResult {
 	remoteOnly: string[];
 	/** Paths both hold with different content. These are what make it dirty. */
 	conflicting: string[];
+	/**
+	 * Paths both hold with the same bytes, with what a tracking record needs.
+	 * The comparison had to hash them anyway; recording the answer lets the
+	 * adoption mark them synced without reading them a second time.
+	 */
+	identical: Record<string, { remoteSha: string; localHash: string }>;
 	localCount: number;
 	remoteCount: number;
 	/** Bytes actually read to settle same-size comparisons. */
@@ -107,6 +113,7 @@ export class SetupCheck {
 		const localOnly: string[] = [];
 		const remoteOnly: string[] = [];
 		const conflicting: string[] = [];
+		const identical: SetupCheckResult['identical'] = {};
 		let bytesHashed = 0;
 
 		// Only paths present on both sides can need hashing, so the expensive
@@ -145,6 +152,8 @@ export class SetupCheck {
 			bytesHashed += bytes.byteLength;
 			if ((await gitBlobSha(bytes)) !== item.sha) {
 				conflicting.push(item.path);
+			} else {
+				identical[item.path] = { remoteSha: item.sha, localHash: await sha256(bytes) };
 			}
 			done++;
 		}
@@ -156,6 +165,7 @@ export class SetupCheck {
 			localOnly,
 			remoteOnly,
 			conflicting,
+			identical,
 			localCount: local.size,
 			remoteCount: remote.entries.size,
 			bytesHashed,
