@@ -556,7 +556,9 @@ export class SettingsTab extends PluginSettingTab {
 
 		details.createEl('p', {
 			cls: 'setting-item-description',
-			text: 'The token is stored in this plugin\'s data file inside your vault. Anyone with access to the vault folder can read it, so scope the token to the one repository.',
+			text: usesSecretStorage(this.app)
+				? 'Uninstalling the plugin clears the token from Obsidian\'s secret storage the next time UltiSync is installed in this vault. Reset (the arrow at the top) clears it immediately.'
+				: 'Anyone with access to the vault folder can read the token, so scope it to the one repository. Uninstalling the plugin deletes its data file, token included.',
 		});
 	}
 

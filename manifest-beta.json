@@ -1,7 +1,7 @@
 {
 	"id": "ultisync",
 	"name": "UltiSync",
-	"version": "1.0.5-beta.1",
+	"version": "1.0.5-beta.2",
 	"minAppVersion": "1.7.2",
 	"description": "Synchronize selected vault files with a GitHub repository using the GitHub REST API. Works on desktop and mobile.",
 	"author": "Sachet Mulimani",

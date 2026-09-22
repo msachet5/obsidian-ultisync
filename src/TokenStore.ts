@@ -1,4 +1,4 @@
-import { App } from 'obsidian';
+import type { App } from 'obsidian';
 
 /**
  * The id the access token is filed under in Obsidian's secret storage. Stable
@@ -42,6 +42,8 @@ export interface LoadedToken {
 	token: string;
 	/** True when the data file still holds a plaintext copy that should go. */
 	migrated: boolean;
+	/** True when a token left behind by an earlier installation was cleared. */
+	discarded: boolean;
 }
 
 /**
@@ -49,21 +51,32 @@ export interface LoadedToken {
  * holds. A plaintext token left by an earlier version, or written while running
  * on an older Obsidian, is moved into the store on sight. The caller then
  * persists, and that write is what clears it from the vault file.
+ *
+ * `freshInstall` says there was no data file at all. Uninstalling a plugin
+ * removes its folder but not the vault's secret store, and Obsidian offers no
+ * hook at uninstall time, so a reinstall is the first moment the leftover can
+ * be noticed. It is cleared rather than adopted: someone who removed the
+ * plugin expects its credential gone with it, and a token that reappears on
+ * its own reads as one that was never really removed.
  */
-export function loadToken(app: App, stored: string): LoadedToken {
+export function loadToken(app: App, stored: string, freshInstall = false): LoadedToken {
 	const store = secretStorage(app);
-	if (!store) return { token: stored, migrated: false };
+	if (!store) return { token: stored, migrated: false, discarded: false };
 
 	try {
 		const secret = store.getSecret(SECRET_ID);
-		if (secret) return { token: secret, migrated: stored !== '' };
-		if (!stored) return { token: '', migrated: false };
+		if (secret && freshInstall) {
+			store.setSecret(SECRET_ID, '');
+			return { token: '', migrated: false, discarded: true };
+		}
+		if (secret) return { token: secret, migrated: stored !== '', discarded: false };
+		if (!stored) return { token: '', migrated: false, discarded: false };
 		store.setSecret(SECRET_ID, stored);
-		return { token: stored, migrated: true };
+		return { token: stored, migrated: true, discarded: false };
 	} catch {
 		// A store that throws is treated as absent. Losing the token would be a
 		// worse outcome than storing it where it already was.
-		return { token: stored, migrated: false };
+		return { token: stored, migrated: false, discarded: false };
 	}
 }
 

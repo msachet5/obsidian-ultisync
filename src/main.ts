@@ -715,7 +715,10 @@ export default class UltiSyncPlugin extends Plugin {
 
 		// Prefer Obsidian's secret storage over the data file. A token found in
 		// the data file is moved across here; the write below is what removes it.
-		const adopted = loadToken(this.app, result.settings.token);
+		// No data file at all means a fresh install, where a token still in the
+		// secret store was left behind by an uninstalled copy and is dropped.
+		const freshInstall = raw === null || raw === undefined;
+		const adopted = loadToken(this.app, result.settings.token, freshInstall);
 		result.settings.token = adopted.token;
 
 		Object.assign(this.settings, result.settings);
@@ -728,7 +731,7 @@ export default class UltiSyncPlugin extends Plugin {
 
 		// Written back only when the stored shape actually differed, so an
 		// ordinary launch does not rewrite the file for nothing.
-		if (result.changed || adopted.migrated) {
+		if (result.changed || adopted.migrated || adopted.discarded) {
 			const at = new Date().toISOString();
 			for (const note of result.notes) {
 				this.state.debugLog.push(`${at} data file upgraded — ${note}`);
@@ -736,6 +739,11 @@ export default class UltiSyncPlugin extends Plugin {
 			if (adopted.migrated) {
 				this.state.debugLog.push(
 					`${at} access token moved into Obsidian's secret storage and cleared from the data file`,
+				);
+			}
+			if (adopted.discarded) {
+				this.state.debugLog.push(
+					`${at} fresh install: a token left in Obsidian's secret storage by an earlier installation was cleared`,
 				);
 			}
 			await this.persistEverything();
