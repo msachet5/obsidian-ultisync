@@ -5,6 +5,7 @@ import {
 	Plugin,
 	PluginSettingTab,
 	Setting,
+	TextComponent,
 	setIcon,
 } from 'obsidian';
 import type { SettingDefinitionItem, SettingDefinitionRender } from 'obsidian';
@@ -19,7 +20,7 @@ import {
 	progressPercent,
 } from '../types';
 import { devicePlatform } from '../platform';
-import { usesSecretStorage } from '../TokenStore';
+import { SavedToken, tokenHint, usesSecretStorage } from '../TokenStore';
 import { normalizeExtension, normalizePath } from '../vault/PathFilter';
 import { BUG_ICON } from './icons';
 
@@ -50,7 +51,12 @@ export interface SettingsHost {
 	getProgress(): SyncProgress | null;
 	/** Whether a transfer or comparison is running, whoever started it. */
 	isBusy(): boolean;
+	/** Tokens that have passed a connection check before, newest first. */
+	listSavedTokens(): SavedToken[];
 }
+
+/** The dropdown value meaning "type one into the field below". */
+const NEW_TOKEN = 'new';
 
 /** The two long-running actions, which show their progress in their button. */
 type Action = 'push' | 'reset';
@@ -122,6 +128,13 @@ export class SettingsTab extends PluginSettingTab {
 	// past the component and clearing the disabled property alone leaves a
 	// button that looks enabled and cannot be clicked.
 	private saveButton: ButtonComponent | null = null;
+
+	// Where the token in the draft comes from: a saved token's id, or the
+	// field. With a saved token chosen the field is out of play, whatever it
+	// says, and what was typed there is kept so switching back restores it.
+	private tokenSource: string = NEW_TOKEN;
+	private typedToken = '';
+	private tokenInput: TextComponent | null = null;
 
 	// The action in flight, and the buttons that show it. Held on the tab
 	// rather than the row: the tab survives a redraw, the row does not, and a
@@ -243,8 +256,66 @@ export class SettingsTab extends PluginSettingTab {
 	/** State both paths reset before they lay the tab out again. */
 	private beginRender(): void {
 		this.saveButton = null;
+		this.tokenInput = null;
 		this.actionButtons = {};
-		this.draft = this.saving ? this.draft : this.draftFromSettings();
+		if (!this.saving) {
+			this.draft = this.draftFromSettings();
+			this.chooseInitialTokenSource();
+		}
+	}
+
+	/**
+	 * The token in use, when it is one of the saved ones, is the natural
+	 * selection. A vault with nothing in use but tokens on offer — a
+	 * reinstall — starts on the newest of them, so taking it up is a Save and
+	 * not a paste; the field stays visible, greyed, so nothing is hidden.
+	 */
+	private chooseInitialTokenSource(): void {
+		const saved = this.host.listSavedTokens();
+		const current = saved.find((entry) => entry.token === this.draft.token);
+		if (current) {
+			this.tokenSource = current.id;
+			this.typedToken = '';
+			return;
+		}
+		const newest = saved[0];
+		if (!this.draft.token && newest) {
+			this.tokenSource = newest.id;
+			this.typedToken = '';
+			this.draft.token = newest.token;
+			return;
+		}
+		this.tokenSource = NEW_TOKEN;
+		this.typedToken = this.draft.token;
+	}
+
+	/** Applies a dropdown choice to the draft and to the field beneath it. */
+	private selectTokenSource(source: string): void {
+		this.tokenSource = source;
+		if (source === NEW_TOKEN) {
+			this.draft.token = this.typedToken;
+		} else {
+			const chosen = this.host.listSavedTokens().find((entry) => entry.id === source);
+			this.draft.token = chosen?.token ?? '';
+		}
+		this.paintTokenField();
+		this.refreshSaveButton();
+	}
+
+	private paintTokenField(): void {
+		const input = this.tokenInput;
+		if (!input) return;
+		const usingSaved = this.tokenSource !== NEW_TOKEN;
+		input.setDisabled(usingSaved);
+		input.setValue(usingSaved ? '' : this.typedToken);
+		input.setPlaceholder(usingSaved ? 'Using the saved token chosen above' : 'github_pat_...');
+	}
+
+	/** One line per saved token: the repository, the tail, and when. */
+	private describeSaved(entry: SavedToken): string {
+		const parts = [entry.label || 'repository not recorded', tokenHint(entry.token)];
+		if (entry.savedAt) parts.push(`saved ${entry.savedAt.slice(0, 10)}`);
+		return parts.join(' · ');
 	}
 
 	/**
@@ -485,20 +556,23 @@ export class SettingsTab extends PluginSettingTab {
 						}),
 					),
 			},
+			...this.savedTokenRows(),
 			{
 				name: 'Personal access token',
 				desc: this.tokenStorageNote(),
 				aliases: ['pat', 'credentials', 'password'],
 				build: (setting) => {
 					setting.addText((text) => {
+						this.tokenInput = text;
 						text.inputEl.type = 'password';
-						text
-							.setPlaceholder('github_pat_...')
-							.setValue(this.draft.token)
-							.onChange((value) => {
-								this.draft.token = value.trim();
-								this.refreshSaveButton();
-							});
+						text.onChange((value) => {
+							// Typing is only heard while the field is the source.
+							if (this.tokenSource !== NEW_TOKEN) return;
+							this.typedToken = value.trim();
+							this.draft.token = this.typedToken;
+							this.refreshSaveButton();
+						});
+						this.paintTokenField();
 					});
 					this.renderTokenHelp(setting.descEl);
 				},
@@ -523,6 +597,35 @@ export class SettingsTab extends PluginSettingTab {
 					// so the button cannot drift out of step with the fields.
 					this.refreshSaveButton();
 				},
+			},
+		];
+	}
+
+	/**
+	 * Offered only when there is something to offer. After a reinstall this
+	 * is where the token from the previous installation turns up: found in
+	 * the vault's secret store, kept aside, and taken up only by choosing it.
+	 */
+	private savedTokenRows(): RowSpec[] {
+		const saved = this.host.listSavedTokens();
+		if (!saved.length) return [];
+
+		return [
+			{
+				name: 'Saved tokens',
+				desc:
+					`${saved.length} token${saved.length === 1 ? '' : 's'} saved in this vault from earlier connection checks. ` +
+					'Choose one to use it, or choose "Enter a new token" to type one below. With a saved token chosen, the field below is not used.',
+				aliases: ['saved pat', 'previous token', 'reinstall'],
+				build: (setting) =>
+					setting.addDropdown((dropdown) => {
+						for (const entry of saved) {
+							dropdown.addOption(entry.id, this.describeSaved(entry));
+						}
+						dropdown.addOption(NEW_TOKEN, 'Enter a new token');
+						dropdown.setValue(this.tokenSource);
+						dropdown.onChange((value) => this.selectTokenSource(value));
+					}),
 			},
 		];
 	}
@@ -557,7 +660,7 @@ export class SettingsTab extends PluginSettingTab {
 		details.createEl('p', {
 			cls: 'setting-item-description',
 			text: usesSecretStorage(this.app)
-				? 'Uninstalling the plugin clears the token from Obsidian\'s secret storage the next time UltiSync is installed in this vault. Reset (the arrow at the top) clears it immediately.'
+				? 'Every token that passes the connection check is kept in Obsidian\'s secret storage for this vault and offered back under Saved tokens, including after the plugin is uninstalled and installed again. Reset (the arrow at the top) forgets them all.'
 				: 'Anyone with access to the vault folder can read the token, so scope it to the one repository. Uninstalling the plugin deletes its data file, token included.',
 		});
 	}

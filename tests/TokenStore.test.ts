@@ -1,7 +1,14 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 import type { App } from 'obsidian';
-import { loadToken, settingsForDisk } from '../src/TokenStore.ts';
+import {
+	forgetAllTokens,
+	listSavedTokens,
+	loadToken,
+	rememberToken,
+	settingsForDisk,
+	tokenHint,
+} from '../src/TokenStore.ts';
 
 /** An App with only the slice of secret storage the store touches. */
 function appWithStore(initial: Record<string, string> = {}): {
@@ -15,6 +22,7 @@ function appWithStore(initial: Record<string, string> = {}): {
 			setSecret: (id: string, secret: string): void => {
 				secrets[id] = secret;
 			},
+			listSecrets: (): string[] => Object.keys(secrets),
 		},
 	} as unknown as App;
 	return { app, secrets };
@@ -26,7 +34,7 @@ describe('loadToken', () => {
 		assert.deepEqual(loadToken(app, 'plaintext'), {
 			token: 'stored',
 			migrated: true,
-			discarded: false,
+			leftover: false,
 		});
 	});
 
@@ -35,21 +43,26 @@ describe('loadToken', () => {
 		assert.deepEqual(loadToken(app, 'plaintext'), {
 			token: 'plaintext',
 			migrated: true,
-			discarded: false,
+			leftover: false,
 		});
 		assert.equal(secrets['ultisync-token'], 'plaintext');
 	});
 
 	// Uninstalling removes the plugin folder but not the vault's secret store,
-	// so a reinstall is the first chance to notice the leftover.
-	it('clears a token left behind by an earlier installation on a fresh install', () => {
+	// so a reinstall is the first chance to notice the leftover. It is offered
+	// back, not taken up.
+	it('keeps a token left by an earlier installation aside on a fresh install', () => {
 		const { app, secrets } = appWithStore({ 'ultisync-token': 'leftover' });
 		assert.deepEqual(loadToken(app, '', true), {
 			token: '',
 			migrated: false,
-			discarded: true,
+			leftover: true,
 		});
-		assert.equal(secrets['ultisync-token'], '');
+		assert.equal(secrets['ultisync-token'], 'leftover');
+		assert.deepEqual(
+			listSavedTokens(app).map((saved) => saved.token),
+			['leftover'],
+		);
 	});
 
 	it('keeps the stored token across an ordinary update, where the data file exists', () => {
@@ -62,8 +75,58 @@ describe('loadToken', () => {
 		assert.deepEqual(loadToken(app, 'plaintext', true), {
 			token: 'plaintext',
 			migrated: false,
-			discarded: false,
+			leftover: false,
 		});
+	});
+});
+
+describe('saved tokens', () => {
+	it('remembers a token with its repository and lists it', () => {
+		const { app } = appWithStore();
+		rememberToken(app, 'github_pat_abcd1234', 'me/vault');
+		const [saved] = listSavedTokens(app);
+		assert.ok(saved);
+		assert.equal(saved.token, 'github_pat_abcd1234');
+		assert.equal(saved.label, 'me/vault');
+		assert.ok(saved.savedAt);
+	});
+
+	it('does not duplicate a token saved twice, and takes the newer label', () => {
+		const { app } = appWithStore();
+		rememberToken(app, 'tok', 'me/one');
+		const first = listSavedTokens(app)[0];
+		rememberToken(app, 'tok', 'me/two');
+		const list = listSavedTokens(app);
+		assert.equal(list.length, 1);
+		assert.equal(list[0]?.label, 'me/two');
+		assert.equal(list[0]?.savedAt, first?.savedAt);
+	});
+
+	it('ignores other plugins\' secrets and entries that were forgotten', () => {
+		const { app } = appWithStore({
+			'someone-else': 'theirs',
+			'ultisync-saved-old': '',
+			'ultisync-saved-bad': 'not json',
+		});
+		rememberToken(app, 'tok', 'me/vault');
+		assert.equal(listSavedTokens(app).length, 1);
+	});
+
+	it('forgets every saved token and the one in use, leaving others alone', () => {
+		const { app, secrets } = appWithStore({
+			'ultisync-token': 'active',
+			'someone-else': 'theirs',
+		});
+		rememberToken(app, 'active', 'me/vault');
+		forgetAllTokens(app);
+		assert.equal(listSavedTokens(app).length, 0);
+		assert.equal(secrets['ultisync-token'], '');
+		assert.equal(secrets['someone-else'], 'theirs');
+	});
+
+	it('shows only the tail of a token', () => {
+		assert.equal(tokenHint('github_pat_abcd1234'), '…1234');
+		assert.equal(tokenHint('abc'), '…');
 	});
 });
 

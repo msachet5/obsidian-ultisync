@@ -24,7 +24,13 @@ import {
 	SyncStateData,
 	SyncStatus,
 } from './types';
-import { loadToken, settingsForDisk } from './TokenStore';
+import {
+	forgetAllTokens,
+	listSavedTokens,
+	loadToken,
+	rememberToken,
+	settingsForDisk,
+} from './TokenStore';
 import {
 	isIgnoredPath,
 	matchesExtensions,
@@ -138,6 +144,7 @@ export default class UltiSyncPlugin extends Plugin {
 				getStatus: () => this.statusSnapshot(),
 				getProgress: () => this.syncManager.getProgress(),
 				isBusy: () => this.checkRunning || this.syncManager.isRunning(),
+				listSavedTokens: () => listSavedTokens(this.app),
 				},
 			this,
 		);
@@ -356,6 +363,10 @@ export default class UltiSyncPlugin extends Plugin {
 			return;
 		}
 
+		// A token that has just proved it works is worth offering back later,
+		// after a reinstall or a switch between repositories.
+		rememberToken(this.app, draft.token, this.repositoryLabel());
+
 		// Only the token changed on a vault that is already linked: there is
 		// nothing to compare, and the comparison would only offer to redo what
 		// is already done.
@@ -427,9 +438,19 @@ export default class UltiSyncPlugin extends Plugin {
 		await this.syncManager.pushEverything();
 	}
 
-	/** Clears credentials and all synchronization bookkeeping. Files are kept. */
+	private repositoryLabel(): string {
+		const { githubOwner, githubRepo } = this.settings;
+		return githubOwner && githubRepo ? `${githubOwner.trim()}/${githubRepo.trim()}` : '';
+	}
+
+	/**
+	 * Clears credentials, every saved token, and all synchronization
+	 * bookkeeping: the data file goes back to its defaults, device id aside.
+	 * Files are kept.
+	 */
 	private async resetEverything(): Promise<void> {
 		this.syncManager?.destroy();
+		forgetAllTokens(this.app);
 
 		const deviceId = this.state.deviceId;
 		// Mutated rather than replaced: the settings tab and the sync manager
@@ -612,7 +633,10 @@ export default class UltiSyncPlugin extends Plugin {
 			this.app,
 			{
 				title: 'Reset all credentials and plugin settings?',
-				body: 'You will need to re-enter the GitHub owner, repository and personal access token. Your notes are not touched and nothing is deleted from GitHub.',
+				body: [
+					'Clears the GitHub owner, repository and token, forgets every saved token, and empties the plugin\'s record of synced files, conflicts and logs.',
+					'Your notes are not touched and nothing is deleted from GitHub. You will need to re-enter the details and choose a starting point again.',
+				],
 				confirmLabel: 'Proceed',
 			},
 			(confirmed) => {
@@ -716,7 +740,8 @@ export default class UltiSyncPlugin extends Plugin {
 		// Prefer Obsidian's secret storage over the data file. A token found in
 		// the data file is moved across here; the write below is what removes it.
 		// No data file at all means a fresh install, where a token still in the
-		// secret store was left behind by an uninstalled copy and is dropped.
+		// secret store was left behind by an uninstalled copy. It is kept in the
+		// saved list and offered back in settings rather than taken up unasked.
 		const freshInstall = raw === null || raw === undefined;
 		const adopted = loadToken(this.app, result.settings.token, freshInstall);
 		result.settings.token = adopted.token;
@@ -729,9 +754,15 @@ export default class UltiSyncPlugin extends Plugin {
 			this.state.deviceId = generateDeviceId();
 		}
 
+		// A token saved by a build that kept only the one in use joins the
+		// saved list now, labelled with the repository it is set up for.
+		if (this.settings.token && !listSavedTokens(this.app).some((s) => s.token === this.settings.token)) {
+			rememberToken(this.app, this.settings.token, this.repositoryLabel());
+		}
+
 		// Written back only when the stored shape actually differed, so an
 		// ordinary launch does not rewrite the file for nothing.
-		if (result.changed || adopted.migrated || adopted.discarded) {
+		if (result.changed || adopted.migrated || adopted.leftover) {
 			const at = new Date().toISOString();
 			for (const note of result.notes) {
 				this.state.debugLog.push(`${at} data file upgraded — ${note}`);
@@ -741,9 +772,9 @@ export default class UltiSyncPlugin extends Plugin {
 					`${at} access token moved into Obsidian's secret storage and cleared from the data file`,
 				);
 			}
-			if (adopted.discarded) {
+			if (adopted.leftover) {
 				this.state.debugLog.push(
-					`${at} fresh install: a token left in Obsidian's secret storage by an earlier installation was cleared`,
+					`${at} fresh install: a token left in Obsidian's secret storage by an earlier installation was kept in the saved list, not taken up`,
 				);
 			}
 			await this.persistEverything();

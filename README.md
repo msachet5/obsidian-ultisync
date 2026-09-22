@@ -115,11 +115,19 @@ folder. UltiSync never syncs that folder, but anything that copies your whole
 vault — iCloud, Dropbox, Obsidian Sync, a backup — copies the token with it.
 You can revoke it on GitHub at any time.
 
+Every token that passes the connection check is also kept in the secret store
+under its own entry, labelled with the repository it was saved for. The
+settings tab lists them under **Saved tokens** whenever there are any: choose
+one and the token field below is greyed out and ignored, or choose **Enter a
+new token** to type one. Saving then runs the same connection check as ever.
+
 Uninstalling the plugin removes its folder but not the vault's secret store,
 and Obsidian gives a plugin no chance to act at uninstall time. So the next
-installation of UltiSync in that vault, finding no data file but a token in
-the store, clears the token rather than adopting it. The reset arrow at the
-top of the settings tab clears it immediately.
+installation of UltiSync in that vault finds the previous token still saved
+and offers it in that list, preselected, rather than filling the field with it
+unasked. Taking it up is a Save; declining it is choosing **Enter a new token**.
+The reset arrow at the top of the settings tab forgets every saved token, along
+with the credentials and the plugin's whole record of synced files.
 
 Use **Test connection** to verify authentication, repository access and the
 branch. It reports the branch ref and the current commit SHA.
