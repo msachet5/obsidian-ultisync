@@ -70,6 +70,7 @@ export class ChangeDetector {
 				continue;
 			}
 
+			const stat = { mtime: file.stat.mtime, size: file.stat.size };
 			const hash = await sha256(await this.vault.readBinary(file));
 			if (hash !== tracked.localHash) {
 				modifiedOrCreated.add(path);
@@ -77,8 +78,8 @@ export class ChangeDetector {
 			}
 
 			// Same content, new stat. Record it so the fast path applies next time.
-			tracked.mtime = file.stat.mtime;
-			tracked.size = file.stat.size;
+			tracked.mtime = stat.mtime;
+			tracked.size = stat.size;
 		}
 
 		for (const path of Object.keys(state.trackedFiles)) {

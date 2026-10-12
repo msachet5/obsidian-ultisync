@@ -1,6 +1,6 @@
 import { App, Platform, TFile, Vault } from 'obsidian';
 import { GitHubClient, RemoteSnapshot } from '../github/GitHubClient';
-import { UltiSyncSettings, SyncStateData, TrackedFile } from '../types';
+import { UltiSyncSettings, SyncStateData, ConflictRecord } from '../types';
 import {
 	isIgnoredPath,
 	isSafeVaultPath,
@@ -9,11 +9,14 @@ import {
 	normalizePath,
 } from '../vault/PathFilter';
 import { base64ToArrayBuffer, sha256 } from '../vault/VaultScanner';
+import { guardedTextWrite, LocalFileChangedError, losslessText } from '../vault/GuardedWrite';
 
 export interface ApplyResult {
 	pulled: number;
 	deletedPaths: Set<string>;
 	trace: string[];
+	conflicts: ConflictRecord[];
+	appliedPaths: Set<string>;
 }
 
 /** Blobs per round of downloads. Small enough that a large pull never holds
@@ -55,12 +58,16 @@ export class PullManager {
 		state: SyncStateData,
 		safeChangedPaths: Iterable<string>,
 		safeDeletedPaths: Iterable<string>,
+		/** Capture explicit conflict choices before network or confirmation waits. */
+		expectedHashes?: Map<string, string | null>,
 	): Promise<ApplyResult> {
 		const deletedPaths = new Set<string>();
 		const trace: string[] = [];
+		const conflicts: ConflictRecord[] = [];
+		const appliedPaths = new Set<string>();
 
 		const changed = [...safeChangedPaths].filter((path) => this.isPullable(path, remote));
-		const pulled = await this.downloadAndWrite(changed, remote, state);
+		const pulled = await this.downloadAndWrite(changed, remote, state, conflicts, expectedHashes, appliedPaths);
 
 		for (const path of safeDeletedPaths) {
 			if (!matchesExtensions(path, this.settings.pullExtensions)) {
@@ -74,6 +81,20 @@ export class PullManager {
 
 			const file = this.vault.getAbstractFileByPath(path);
 			if (file instanceof TFile) {
+				const stat = { mtime: file.stat.mtime, size: file.stat.size };
+				const hash = await sha256(await this.vault.readBinary(file));
+				const expectedHash = expectedHashes?.has(path)
+					? expectedHashes.get(path) : state.trackedFiles[path]?.localHash;
+				if (expectedHash !== hash) {
+					conflicts.push(this.conflict(path, hash, remote));
+					trace.push(`${path}: kept locally, content changed before deletion`);
+					continue;
+				}
+				if (this.vault.getAbstractFileByPath(path) !== file || file.path !== path ||
+					file.stat.mtime !== stat.mtime || file.stat.size !== stat.size) {
+					conflicts.push(this.conflict(path, hash, remote));
+					continue;
+				}
 				await this.trash(file);
 				trace.push(`${path}: found locally, moved to trash`);
 			} else {
@@ -87,7 +108,7 @@ export class PullManager {
 			deletedPaths.add(path);
 		}
 
-		return { pulled, deletedPaths, trace };
+		return { pulled, deletedPaths, trace, conflicts, appliedPaths };
 	}
 
 	/**
@@ -101,7 +122,7 @@ export class PullManager {
 		remote: RemoteSnapshot,
 		state: SyncStateData,
 		overwriteExisting = false,
-	): Promise<{ pulled: number; skipped: number }> {
+	): Promise<{ pulled: number; skipped: number; conflicts: ConflictRecord[] }> {
 		if (this.settings.pullExtensions.length === 0) {
 			throw new Error('Select at least one pull extension before the initial pull.');
 		}
@@ -136,11 +157,18 @@ export class PullManager {
 			);
 		}
 
-		const pulled = await this.downloadAndWrite(paths, remote, state);
+		const conflicts: ConflictRecord[] = [];
+		const expectedHashes = new Map<string, string | null>();
+		for (const path of paths) {
+			const file = this.vault.getAbstractFileByPath(path);
+			expectedHashes.set(path, overwriteExisting && file instanceof TFile
+				? await sha256(await this.vault.readBinary(file)) : null);
+		}
+		const pulled = await this.downloadAndWrite(paths, remote, state, conflicts, expectedHashes);
 		// Everything in the repository the extension filters exclude. Reported so
 		// a repository that is mostly unsupported file types does not look like a
 		// pull that quietly failed.
-		return { pulled, skipped: remote.entries.size - paths.length };
+		return { pulled, skipped: remote.entries.size - paths.length, conflicts };
 	}
 
 	// Blobs are fetched a batch at a time rather than strictly one after another.
@@ -150,6 +178,9 @@ export class PullManager {
 		paths: string[],
 		remote: RemoteSnapshot,
 		state: SyncStateData,
+		conflicts: ConflictRecord[],
+		expectedHashes?: Map<string, string | null>,
+		appliedPaths: Set<string> = new Set(),
 	): Promise<number> {
 		let pulled = 0;
 		const totalBytes = paths.reduce(
@@ -177,13 +208,26 @@ export class PullManager {
 
 			for (const item of fetched) {
 				if (!item) continue;
-				await this.writeBinaryFile(item.path, item.bytes);
+				const expectedHash = expectedHashes?.has(item.path)
+					? expectedHashes.get(item.path) ?? null
+					: state.trackedFiles[item.path]?.localHash ?? null;
+				let wrote: boolean;
+				try {
+					wrote = await this.writeBinaryFile(item.path, item.bytes, expectedHash);
+				} catch (error) {
+					if (!(error instanceof LocalFileChangedError)) throw error;
+					const file = this.vault.getAbstractFileByPath(item.path);
+					const hash = file instanceof TFile
+						? await sha256(await this.vault.readBinary(file)) : null;
+					conflicts.push(this.conflict(item.path, hash, remote));
+					continue;
+				}
 				state.trackedFiles[item.path] = {
 					localHash: await sha256(item.bytes),
 					remoteSha: item.sha,
-					...this.statOf(item.path),
 				};
-				pulled++;
+				appliedPaths.add(item.path);
+				if (wrote) pulled++;
 				this.onProgress(pulled, paths.length, totalBytes);
 			}
 		}
@@ -211,28 +255,65 @@ export class PullManager {
 		);
 	}
 
-	// Read back after writing: the stat has to describe the file as it now sits on
-	// disk, or the change detector's fast path will think it was edited.
-	private statOf(path: string): Pick<TrackedFile, 'mtime' | 'size'> {
-		const file = this.vault.getAbstractFileByPath(normalizePath(path));
-		if (!(file instanceof TFile)) return {};
-		return { mtime: file.stat.mtime, size: file.stat.size };
+	private conflict(path: string, localHash: string | null, remote: RemoteSnapshot): ConflictRecord {
+		const entry = remote.entries.get(path);
+		return {
+			path,
+			detectedAt: new Date().toISOString(),
+			localHash,
+			remoteSha: entry?.sha ?? null,
+			remoteExists: entry?.type === 'blob',
+			conflictCopyPath: null,
+		};
 	}
 
-	private async writeBinaryFile(path: string, bytes: ArrayBuffer): Promise<void> {
+	private async writeBinaryFile(
+		path: string,
+		bytes: ArrayBuffer,
+		expectedHash: string | null,
+	): Promise<boolean> {
 		const normalized = normalizePath(path);
+		const remoteHash = await sha256(bytes);
 		await this.ensureParentFolder(normalized);
-		this.onBeforeWrite(normalized);
 
 		const existing = this.vault.getAbstractFileByPath(normalized);
 		if (existing instanceof TFile) {
+			const stat = { mtime: existing.stat.mtime, size: existing.stat.size };
+			const current = await this.vault.readBinary(existing);
+			const hash = await sha256(current);
+			if (this.vault.getAbstractFileByPath(normalized) !== existing || existing.path !== normalized ||
+				existing.stat.mtime !== stat.mtime || existing.stat.size !== stat.size) {
+				throw new LocalFileChangedError(normalized);
+			}
+			if (hash === remoteHash) return false;
+			if (hash !== expectedHash) throw new LocalFileChangedError(normalized);
+			const text = /\.(md|canvas|base|svg)$/i.test(normalized) ? losslessText(bytes) : null;
+			if (text !== null && losslessText(current) !== null) {
+				await guardedTextWrite(this.vault, existing, current, text,
+					() => this.onBeforeWrite(normalized));
+				return true;
+			}
+			// Binary writes lack process()'s atomic check. The content check above
+			// protects edits made during download, but the API call can still wait.
+			this.onBeforeWrite(normalized);
 			await this.vault.modifyBinary(existing, bytes);
-			return;
+			return true;
 		}
 		if (existing) {
-			throw new Error(`Cannot write ${normalized}: a folder already exists at that path.`);
+			throw new LocalFileChangedError(normalized);
 		}
-		await this.vault.createBinary(normalized, bytes);
+		// A locally deleted tracked file must stay deleted until resolved.
+		if (expectedHash !== null) throw new LocalFileChangedError(normalized);
+		this.onBeforeWrite(normalized);
+		try {
+			await this.vault.createBinary(normalized, bytes);
+		} catch (error) {
+			// createBinary refuses an existing path. A creation queued behind
+			// ours must never turn into modifyBinary on retry.
+			if (this.vault.getAbstractFileByPath(normalized)) throw new LocalFileChangedError(normalized);
+			throw error;
+		}
+		return true;
 	}
 
 	private async ensureParentFolder(path: string): Promise<void> {

@@ -18,6 +18,7 @@ import {
 } from '../types';
 import { isIgnoredPath, isSafeVaultPath, matchesExtensions } from '../vault/PathFilter';
 import { bytesToBase64, gitBlobSha, sha256 } from '../vault/VaultScanner';
+import { guardedTextWrite, LocalFileChangedError } from '../vault/GuardedWrite';
 import { ChangeDetector } from './ChangeDetector';
 import { attemptMerge } from './MergeAttempt';
 import { RenamePair, formatRenameLine } from './RenameRecord';
@@ -33,6 +34,8 @@ const FILE_MODE = '100644';
 
 export interface PushOptions {
 	includeDeletions: boolean;
+	/** A conflict choice applies only while GitHub still holds this version. */
+	chosenLocalPaths?: Map<string, string | null>;
 	/** Paths the user renamed themselves, exempt from the new-file settle delay. */
 	userNamed?: Set<string>;
 	/**
@@ -350,6 +353,9 @@ export class PushManager {
 			this.settings.pushExtensions,
 			options.userNamed,
 		);
+		for (const path of options.chosenLocalPaths?.keys() ?? []) {
+			detected.modifiedOrCreated.add(path);
+		}
 
 		const trace = [
 			`vault rescan found deleted=[${[...detected.deleted].join(', ')}] modifiedOrCreated=[${[
@@ -405,6 +411,11 @@ export class PushManager {
 			const localBlobSha = await gitBlobSha(bytes);
 			const remoteEntry = remote.entries.get(path);
 			const tracked = state.trackedFiles[path];
+			const chosenLocal = options.chosenLocalPaths?.has(path) ?? false;
+			if (chosenLocal && options.chosenLocalPaths?.get(path) !== (remoteEntry?.sha ?? null)) {
+				collisions.push(path);
+				continue;
+			}
 
 			// The remote already holds exactly these bytes, so only the local
 			// bookkeeping was out of date.
@@ -412,8 +423,6 @@ export class PushManager {
 				state.trackedFiles[path] = {
 					localHash: await sha256(bytes),
 					remoteSha: localBlobSha,
-					mtime: file.stat.mtime,
-					size: file.stat.size,
 				};
 				continue;
 			}
@@ -421,7 +430,7 @@ export class PushManager {
 			const remoteIsUnknown =
 				remoteEntry !== undefined && (!tracked || tracked.remoteSha !== remoteEntry.sha);
 
-			if (remoteIsUnknown && options.forceOverwrite) {
+			if (remoteIsUnknown && (options.forceOverwrite || chosenLocal)) {
 				trace.push(`${path}: differs from GitHub, sent as-is (this vault chosen as winner)`);
 			} else if (remoteIsUnknown) {
 				const outcome = await attemptMerge(this.github, path, bytes, tracked, remoteEntry);
@@ -430,8 +439,14 @@ export class PushManager {
 					continue;
 				}
 
-				await this.vault.process(file, () => outcome.merged);
-				const mergedBytes = await this.vault.readBinary(file);
+				try {
+					await guardedTextWrite(this.vault, file, bytes, outcome.merged);
+				} catch (error) {
+					if (!(error instanceof LocalFileChangedError)) throw error;
+					collisions.push(path);
+					continue;
+				}
+				const mergedBytes = new TextEncoder().encode(outcome.merged).buffer;
 				const mergedBlob = await this.createBlobOrSkip(
 					path,
 					mergedBytes,
@@ -444,8 +459,6 @@ export class PushManager {
 				pushedTracking.set(path, {
 					localHash: await sha256(mergedBytes),
 					remoteSha: mergedBlob.sha,
-					mtime: file.stat.mtime,
-					size: file.stat.size,
 				});
 				continue;
 			}
@@ -456,8 +469,6 @@ export class PushManager {
 			pushedTracking.set(path, {
 				localHash: await sha256(bytes),
 				remoteSha: blob.sha,
-				mtime: file.stat.mtime,
-				size: file.stat.size,
 			});
 		}
 

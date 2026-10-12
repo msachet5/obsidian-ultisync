@@ -38,12 +38,13 @@ import {
 	normalizePath,
 } from '../vault/PathFilter';
 import { base64ToArrayBuffer, gitBlobSha, sha256 } from '../vault/VaultScanner';
+import { guardedTextWrite, LocalFileChangedError } from '../vault/GuardedWrite';
 import { confirmWithModal } from '../ui/ConfirmModal';
 import { ChangeDetector } from './ChangeDetector';
 import { ConflictDetector, IdenticalPaths } from './ConflictDetector';
 import { attemptMerge } from './MergeAttempt';
 import { PullManager } from './PullManager';
-import { PushManager, PushOptions } from './PushManager';
+import { PushManager, PushOptions, PushResult } from './PushManager';
 import { renamesDeclaredIn } from './RenameRecord';
 import { pathsNeverPulled } from './Verify';
 import { ProgressCallback, SetupCheck, SetupCheckResult } from './SetupCheck';
@@ -127,6 +128,7 @@ export class SyncManager {
 	private running = false;
 	private requested = false;
 	private dirty = false;
+	private localChangeVersion = 0;
 	private pushTimer: number | null = null;
 	private pollTimer: number | null = null;
 
@@ -421,8 +423,14 @@ export class SyncManager {
 		return this.settings.syncEnabled;
 	}
 
-	markDirty(): void {
+	markDirty(path?: string): void {
 		if (!this.syncEnabled) return;
+		const tracked = path ? this.state.trackedFiles[normalizePath(path)] : undefined;
+		if (tracked) {
+			delete tracked.mtime;
+			delete tracked.size;
+		}
+		this.localChangeVersion++;
 		if (this.needsStartingPoint()) {
 			this.dirty = true;
 			return;
@@ -544,6 +552,7 @@ export class SyncManager {
 					await this.app.fileManager.trashFile(file);
 				}
 				const applied = await pull.applyRemoteChanges(remote, this.state, toPull, []);
+				await this.recordConflicts(applied.conflicts, remote);
 				pulled = applied.pulled;
 			}
 
@@ -640,6 +649,7 @@ export class SyncManager {
 
 			const pull = this.pullManager(github);
 			const result = await pull.performInitialPull(remote, this.state, overwriteExisting);
+			await this.recordConflicts(result.conflicts, remote);
 
 			const now = new Date().toISOString();
 			this.state.lastSyncedCommit = remote.commitSha;
@@ -649,7 +659,8 @@ export class SyncManager {
 			await this.stateStore.save(this.state);
 
 			this.dirty = false;
-			this.setStatus('synced', `Initial pull complete: ${result.pulled} file(s).`);
+			this.setStatus(Object.keys(this.state.conflicts).length ? 'conflict' : 'synced',
+				`Initial pull complete: ${result.pulled} file(s).`);
 			new Notice(
 				`UltiSync: pulled ${result.pulled} file(s).` +
 					(result.skipped
@@ -862,14 +873,21 @@ export class SyncManager {
 	// disabled precisely when synchronization is on.
 	async performPush(
 		trigger: PushTrigger = 'automatic',
-		adoption: Pick<PushOptions, 'forceOverwrite' | 'deletePaths'> = {},
+		adoption: Pick<PushOptions, 'forceOverwrite' | 'deletePaths' | 'chosenLocalPaths'> = {},
 	): Promise<boolean> {
+		return (await this.executePush(trigger, adoption)).pushed;
+	}
+
+	private async executePush(
+		trigger: PushTrigger = 'automatic',
+		adoption: Pick<PushOptions, 'forceOverwrite' | 'deletePaths' | 'chosenLocalPaths'> = {},
+	): Promise<PushResult> {
 		// Nothing automatic runs while a push is in flight, however long it takes.
 		this.syncHoldUntil = Date.now() + POLL_HOLD_AFTER_PUSH_MS;
 
-		let landed: string | null = null;
+		let result: PushResult;
 		try {
-			landed = await this.performPushInternal(trigger, adoption);
+			result = await this.performPushInternal(trigger, adoption);
 		} finally {
 			// The settling period counts from the moment the push actually
 			// finished. Arming it only at the start left a long push clear to be
@@ -877,8 +895,8 @@ export class SyncManager {
 			this.syncHoldUntil = Date.now() + POLL_HOLD_AFTER_PUSH_MS;
 		}
 
-		if (landed) await this.waitForBranchToCatchUp(landed);
-		return landed !== null;
+		if (result.commitSha) await this.waitForBranchToCatchUp(result.commitSha);
+		return result;
 	}
 
 	/**
@@ -920,11 +938,12 @@ export class SyncManager {
 		this.debug('push not confirmed within the settle window, holding for the full period');
 	}
 
-	/** Returns the commit this push created, or null when nothing was pushed. */
+	/** Applies tracking and reports which paths this push sent. */
 	private async performPushInternal(
 		trigger: PushTrigger,
-		adoption: Pick<PushOptions, 'forceOverwrite' | 'deletePaths'>,
-	): Promise<string | null> {
+		adoption: Pick<PushOptions, 'forceOverwrite' | 'deletePaths' | 'chosenLocalPaths'>,
+	): Promise<PushResult> {
+		const localChangeVersion = this.localChangeVersion;
 		const github = this.getClient();
 		const push = this.pushManager(github);
 
@@ -1008,12 +1027,15 @@ export class SyncManager {
 			}
 		}
 
-		await this.pruneConflictsAgainstSyncedTree();
+		if (result.commitSha && this.state.lastSyncedCommit === result.commitSha) {
+			await this.pruneConflictsAgainstSyncedTree();
+		}
 		this.state.lastRemoteCheck = new Date().toISOString();
 		await this.stateStore.save(this.state);
 
 		this.clearErrorLatch();
-		this.dirty = false;
+		this.dirty = this.localChangeVersion !== localChangeVersion;
+		if (this.dirty) this.scheduleDebouncedPush();
 		// A push is the moment this vault's record of the remote is freshest,
 		// and the moment it is most worth asking whether the vault matches it.
 		this.lastVerifyAt = 0;
@@ -1033,7 +1055,7 @@ export class SyncManager {
 		);
 		this.refreshUI();
 
-		return result.pushed ? result.commitSha : null;
+		return result;
 	}
 
 	// A collision is the one thing GitHub cannot merge for us: the same file
@@ -1044,8 +1066,6 @@ export class SyncManager {
 
 		const conflicts: ConflictRecord[] = [];
 		for (const path of paths) {
-			if (this.state.conflicts[path]) continue;
-
 			const file = this.vault.getAbstractFileByPath(path);
 			const localHash =
 				file instanceof TFile ? await sha256(await this.vault.readBinary(file)) : null;
@@ -1081,8 +1101,12 @@ export class SyncManager {
 		const outcome = await attemptMerge(github, path, bytes, tracked, remoteEntry);
 		if (!outcome || !remoteEntry?.sha) return false;
 
-		this.markSelfWrite(path);
-		await this.vault.process(file, () => outcome.merged);
+		try {
+			await guardedTextWrite(this.vault, file, bytes, outcome.merged, () => this.markSelfWrite(path));
+		} catch (error) {
+			if (error instanceof LocalFileChangedError) return false;
+			throw error;
+		}
 		this.record('merge', `Merged remote edits into ${basename(path)}`);
 
 		this.state.trackedFiles[path] = {
@@ -1119,6 +1143,7 @@ export class SyncManager {
 		relation = 'ahead',
 		declaredRenames: Map<string, string> = new Map(),
 	): Promise<void> {
+		const localChangeVersion = this.localChangeVersion;
 		this.setStatus('pulling', 'Inspecting remote changes...');
 		this.record('info', 'New changes on GitHub');
 
@@ -1205,7 +1230,6 @@ export class SyncManager {
 			].join(', ')}] safeRemoteDeleted=[${[...safeRemoteDeleted].join(', ')}]`,
 		);
 
-		this.markSelfWrite(...safeRemoteChanged, ...safeRemoteDeleted);
 		const pull = this.pullManager(github);
 		const pullResult = await pull.applyRemoteChanges(
 			remote,
@@ -1213,6 +1237,7 @@ export class SyncManager {
 			safeRemoteChanged,
 			safeRemoteDeleted,
 		);
+		await this.recordConflicts(pullResult.conflicts, remote);
 		this.debug(
 			`pull-delete-result actuallyDeleted=[${[...pullResult.deletedPaths].join(
 				', ',
@@ -1243,7 +1268,8 @@ export class SyncManager {
 		this.state.lastSuccessfulPull = now;
 		await this.stateStore.save(this.state);
 
-		this.dirty = local.modifiedOrCreated.size > 0 || local.deleted.size > 0;
+		this.dirty = this.localChangeVersion !== localChangeVersion ||
+			local.modifiedOrCreated.size > 0 || local.deleted.size > 0;
 		if (this.dirty) {
 			this.scheduleDebouncedPush();
 		}
@@ -1379,19 +1405,21 @@ export class SyncManager {
 			if (!movable) continue;
 
 			const tracked = this.state.trackedFiles[from];
-			this.markSelfWrite(from, to);
+			// A rename with edited remote content must take the ordinary pull
+			// path. Recording that new sha for the old bytes would hide the edit.
+			if (!tracked || sha !== tracked.remoteSha) continue;
 			await this.ensureParentFolder(to);
+			if ((await sha256(await this.vault.readBinary(file))) !== tracked.localHash) continue;
+			if (file.path !== from || this.vault.getAbstractFileByPath(from) !== file ||
+				this.vault.getAbstractFileByPath(to)) continue;
+			this.markSelfWrite(from, to);
 			await this.vault.rename(file, to);
 			delete this.state.trackedFiles[from];
 
 			if (tracked && sha) {
-				const moved = this.vault.getAbstractFileByPath(to);
 				this.state.trackedFiles[to] = {
-					...tracked,
+					localHash: tracked.localHash,
 					remoteSha: sha,
-					...(moved instanceof TFile
-						? { mtime: moved.stat.mtime, size: moved.stat.size }
-						: {}),
 				};
 			}
 
@@ -1506,7 +1534,7 @@ export class SyncManager {
 		remote: RemoteSnapshot,
 	): Promise<void> {
 		for (const conflict of conflicts) {
-			if (this.state.conflicts[conflict.path]) continue;
+			if (this.state.conflicts[conflict.path]?.remoteSha === conflict.remoteSha) continue;
 			conflict.conflictCopyPath = await this.createConflictCopy(conflict.path, remote);
 			this.state.conflicts[conflict.path] = conflict;
 		}
@@ -1536,69 +1564,111 @@ export class SyncManager {
 		const dot = path.lastIndexOf('.');
 		const stem = dot >= 0 ? path.slice(0, dot) : path;
 		const ext = dot >= 0 ? path.slice(dot) : '';
-		const copyPath = `${stem} (conflict - ${this.state.deviceId})${ext}`;
-
-		if (this.vault.getAbstractFileByPath(copyPath)) {
-			return copyPath;
+		for (let suffix = 0; ; suffix++) {
+			const copyPath = `${stem} (conflict - ${this.state.deviceId}${suffix ? ` - ${suffix}` : ''})${ext}`;
+			if (this.vault.getAbstractFileByPath(copyPath)) continue;
+			await this.ensureParentFolder(copyPath);
+			this.markSelfWrite(copyPath);
+			try {
+				await this.vault.createBinary(copyPath, bytes);
+				return copyPath;
+			} catch (error) {
+				if (!this.vault.getAbstractFileByPath(copyPath)) throw error;
+			}
 		}
-
-		await this.ensureParentFolder(copyPath);
-		this.markSelfWrite(copyPath);
-		await this.vault.createBinary(copyPath, bytes);
-		return copyPath;
 	}
 
 	async keepLocal(path: string): Promise<void> {
-		if (!this.state.conflicts[path]) return;
-		delete this.state.conflicts[path];
-		await this.stateStore.save(this.state);
-		this.markDirty();
-		await this.pushNow();
+		const conflict = this.state.conflicts[path];
+		if (!conflict || this.running) return;
+		this.running = true;
+		try {
+			const result = await this.executePush('manual', {
+				chosenLocalPaths: new Map([[path, conflict.remoteSha]]),
+			});
+			const file = this.vault.getAbstractFileByPath(path);
+			const alreadyIdentical = file instanceof TFile &&
+				result.remote?.entries.get(path)?.sha === await gitBlobSha(await this.vault.readBinary(file));
+			if (result.writtenShas[path] || alreadyIdentical) {
+				delete this.state.conflicts[path];
+				await this.stateStore.save(this.state);
+			}
+		} finally {
+			this.running = false;
+			this.clearProgress();
+			await this.runRequestedIfNeeded();
+		}
 	}
 
 	async keepRemote(path: string): Promise<void> {
-		if (!this.state.conflicts[path]) return;
-
-		const github = this.getClient();
-		const ref = await github.getBranchReference();
-		const commit = await github.getCommit(ref.object.sha);
-		const remote = await github.readTreeSnapshot(ref.object.sha, commit.tree.sha);
-		const pull = this.pullManager(github);
-
-		if (remote.entries.has(path)) {
-			await pull.applyRemoteChanges(remote, this.state, new Set([path]), new Set());
-		} else {
-			// Keeping a remote version that does not exist means deleting the local
-			// file, which is worth asking about explicitly.
+		if (this.running) return;
+		this.running = true;
+		try {
+			const conflict = this.state.conflicts[path];
+			if (!conflict) return;
+			// The choice covers the file the user saw, not edits made while waiting
+			// for GitHub or the deletion confirmation.
 			const localFile = this.vault.getAbstractFileByPath(path);
-			if (localFile instanceof TFile) {
-				const proceed = await confirmWithModal(this.app, {
-					title: 'Delete the local file?',
-					body: [
-						`"${path}" does not exist on GitHub.`,
-						"Keeping the remote version means deleting your local copy. It is trashed, following Obsidian's own setting for deleted files.",
-					],
-					confirmLabel: 'Delete',
-				});
-				if (!proceed) {
-					new Notice('UltiSync: kept the local file. Conflict left unresolved.');
-					return;
-				}
+			const expectedHash = localFile instanceof TFile
+				? await sha256(await this.vault.readBinary(localFile)) : null;
+			const expectedHashes = new Map([[path, expectedHash]]);
+
+			const github = this.getClient();
+			const ref = await github.getBranchReference();
+			const commit = await github.getCommit(ref.object.sha);
+			const remote = await github.readTreeSnapshot(ref.object.sha, commit.tree.sha);
+			if ((remote.entries.get(path)?.sha ?? null) !== conflict.remoteSha) {
+				await this.recordCollisions([path], remote);
+				new Notice('UltiSync: the remote version changed. Review the updated conflict.');
+				return;
 			}
-			await pull.applyRemoteChanges(remote, this.state, new Set(), new Set([path]));
+			const pull = this.pullManager(github);
+			let result;
+
+			if (remote.entries.has(path)) {
+				result = await pull.applyRemoteChanges(remote, this.state, new Set([path]), new Set(), expectedHashes);
+			} else {
+				// Keeping a remote version that does not exist means deleting the local
+				// file, which is worth asking about explicitly.
+				if (localFile instanceof TFile) {
+					const proceed = await confirmWithModal(this.app, {
+						title: 'Delete the local file?',
+						body: [
+							`"${path}" does not exist on GitHub.`,
+							"Keeping the remote version means deleting your local copy. It is trashed, following Obsidian's own setting for deleted files.",
+						],
+						confirmLabel: 'Delete',
+					});
+					if (!proceed) {
+						new Notice('UltiSync: kept the local file. Conflict left unresolved.');
+						return;
+					}
+				}
+				result = await pull.applyRemoteChanges(remote, this.state, new Set(), new Set([path]), expectedHashes);
+			}
+			if (result.conflicts.length || (!result.appliedPaths.has(path) && !result.deletedPaths.has(path))) {
+				await this.recordConflicts(result.conflicts, remote);
+				new Notice('UltiSync: could not apply the remote version. Conflict left unresolved.');
+				return;
+			}
+
+			delete this.state.conflicts[path];
+			const appliedSha = remote.entries.get(path)?.sha;
+			if (appliedSha) this.state.lastSyncedTree[path] = appliedSha;
+			else delete this.state.lastSyncedTree[path];
+			this.state.lastRemoteCheck = new Date().toISOString();
+			await this.stateStore.save(this.state);
+
+			this.setStatus(
+				Object.keys(this.state.conflicts).length ? 'conflict' : 'synced',
+				`Kept remote version of ${path}.`,
+			);
+			this.refreshUI();
+		} finally {
+			this.running = false;
+			this.clearProgress();
+			await this.runRequestedIfNeeded();
 		}
-
-		delete this.state.conflicts[path];
-		this.state.lastSyncedCommit = ref.object.sha;
-		this.state.lastSyncedTree = treeMapOf(remote);
-		this.state.lastRemoteCheck = new Date().toISOString();
-		await this.stateStore.save(this.state);
-
-		this.setStatus(
-			Object.keys(this.state.conflicts).length ? 'conflict' : 'synced',
-			`Kept remote version of ${path}.`,
-		);
-		this.refreshUI();
 	}
 
 	async clearConflict(path: string): Promise<void> {
@@ -1850,9 +1920,9 @@ export class SyncManager {
 		const commit = await github.getCommit(head);
 		const remote = await github.readTreeSnapshot(head, commit.tree.sha);
 
-		this.markSelfWrite(...paths);
 		const pull = this.pullManager(github);
 		const result = await pull.applyRemoteChanges(remote, this.state, paths, []);
+		await this.recordConflicts(result.conflicts, remote);
 		for (const line of result.trace) this.debug(`verify-trace ${line}`);
 
 		if (result.pulled) {

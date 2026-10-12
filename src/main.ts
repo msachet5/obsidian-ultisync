@@ -686,7 +686,10 @@ export default class UltiSyncPlugin extends Plugin {
 
 	private registerVaultEvents(): void {
 		this.registerEvent(this.app.vault.on('create', (file) => this.handleVaultChange(file)));
-		this.registerEvent(this.app.vault.on('modify', (file) => this.handleVaultChange(file)));
+		// A grace period cannot distinguish our write from a user edit that
+		// follows it. Rescan modifications even during that period; matching
+		// content will produce no outgoing commit.
+		this.registerEvent(this.app.vault.on('modify', (file) => this.handleVaultPath(file.path, true)));
 		this.registerEvent(this.app.vault.on('delete', (file) => this.handleVaultChange(file)));
 
 		this.registerEvent(
@@ -723,13 +726,13 @@ export default class UltiSyncPlugin extends Plugin {
 		this.handleVaultPath(file.path);
 	}
 
-	private handleVaultPath(path: string): void {
+	private handleVaultPath(path: string, modification = false): void {
 		if (this.vaultEventsMuted) return;
-		if (this.syncManager.isSelfWrite(path)) return;
+		if (!modification && this.syncManager.isSelfWrite(path)) return;
 		if (isIgnoredPath(path, this.settings.ignoredPaths)) return;
 
 		if (matchesExtensions(normalizePath(path), this.settings.pushExtensions)) {
-			this.syncManager.markDirty();
+			this.syncManager.markDirty(path);
 		}
 	}
 
